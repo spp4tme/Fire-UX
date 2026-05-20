@@ -35,7 +35,7 @@
 
 ### 1️⃣ Cloner le dépôt
 ```bash
-git clone https://github.com/CodeD-Roger/fire-ux.git
+git clone https://github.com/spp4tme/fire-ux.git
 cd fire-ux
 ```
 
