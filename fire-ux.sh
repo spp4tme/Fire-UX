@@ -1,2139 +1,1384 @@
 #!/bin/bash
 
-# fire-ux.sh - Script interactif de gestion du pare-feu iptables
-# Author: v0
-# Date: 2025-03-23
+# fire-ux.sh - Interactive iptables firewall manager
+# Author: v0 / Claude
 
-# Colors for better UI
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STYLE & COLOR DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Check if script is run as root
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+
+# Fire gradient (256-color ANSI)
+FIRE1='\033[38;5;196m'
+FIRE2='\033[38;5;202m'
+FIRE3='\033[38;5;208m'
+FIRE4='\033[38;5;214m'
+FIRE5='\033[38;5;220m'
+
+# UI palette
+C_BORDER='\033[38;5;237m'
+C_BORDER_LT='\033[38;5;243m'
+C_TITLE='\033[1;38;5;214m'
+C_SUBTITLE='\033[38;5;246m'
+C_SUCCESS='\033[38;5;82m'
+C_ERROR='\033[38;5;196m'
+C_WARN='\033[38;5;220m'
+C_INFO='\033[38;5;39m'
+C_TEXT='\033[38;5;252m'
+C_MUTED='\033[38;5;240m'
+C_NUM='\033[1;38;5;208m'
+C_KEY='\033[38;5;228m'
+C_ACCENT='\033[38;5;75m'
+C_LABEL='\033[38;5;246m'
+C_HIGHLIGHT='\033[1;38;5;255m'
+C_TAG_GREEN='\033[38;5;22m'
+C_TAG_RED='\033[38;5;88m'
+
+# Legacy aliases — used throughout logic code unchanged
+RED="$C_ERROR"
+GREEN="$C_SUCCESS"
+YELLOW="$C_WARN"
+BLUE="$C_INFO"
+PURPLE='\033[38;5;135m'
+CYAN='\033[38;5;87m'
+NC="$RESET"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOOTSTRAP
+# ═══════════════════════════════════════════════════════════════════════════════
+
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}This script must be run as root (sudo).${NC}"
+  echo -e "${C_ERROR}${BOLD}  ✗  This script must be run as root (sudo).${RESET}"
   exit 1
 fi
 
-# Configuration directory
 CONFIG_DIR="/etc/fire-ux"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 ROUTES_DIR="$CONFIG_DIR/routes"
 LOG_FILE="/var/log/fire-ux.log"
 
-# Create necessary directories if they don't exist
 mkdir -p "$PROFILES_DIR"
 mkdir -p "$ROUTES_DIR"
 touch "$LOG_FILE"
 
-# Log function
 log_action() {
-  local message="$1"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" >> "$LOG_FILE"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
-# Function to display header
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UI PRIMITIVES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+repeat_char() {
+  local char="$1" count="$2" out=""
+  for ((i=0; i<count; i++)); do out+="$char"; done
+  printf '%s' "$out"
+}
+
+# ─── Message helpers ──────────────────────────────────────────────────────────
+
+msg_ok()   { echo -e "\n  ${C_SUCCESS}${BOLD}✓${RESET}  ${C_TEXT}${1}${RESET}"; }
+msg_err()  { echo -e "\n  ${C_ERROR}${BOLD}✗${RESET}  ${C_TEXT}${1}${RESET}"; }
+msg_warn() { echo -e "\n  ${C_WARN}${BOLD}⚠${RESET}  ${C_TEXT}${1}${RESET}"; }
+msg_info() { echo -e "\n  ${C_INFO}${BOLD}→${RESET}  ${C_TEXT}${1}${RESET}"; }
+
+press_enter() {
+  echo -e "\n  ${C_MUTED}Press ${C_KEY}[Enter]${C_MUTED} to continue...${RESET}"
+  read
+}
+
+ask_confirm() {
+  echo -en "\n  ${C_WARN}${BOLD}?${RESET}  ${C_TEXT}${1:-Confirm?} ${C_MUTED}[${C_KEY}y${C_MUTED}/${C_KEY}n${C_MUTED}]:${RESET}  "
+  read -r _ans
+  [[ "$_ans" =~ ^[Yy]$ ]]
+}
+
+# ─── Section & menu drawing ───────────────────────────────────────────────────
+
+# Open box (left border + top rule, no right border)
+open_box() {
+  local title="$1"
+  local width="${2:-56}"
+  local dashes
+  dashes=$(repeat_char '═' $((width - ${#title} - 5)))
+  echo -e "\n  ${C_BORDER}╔══ ${C_TITLE}${title}${RESET} ${C_BORDER}${dashes}${RESET}"
+  echo -e "  ${C_BORDER}║${RESET}"
+}
+
+close_box() {
+  local width="${1:-56}"
+  local dashes
+  dashes=$(repeat_char '═' $width)
+  echo -e "  ${C_BORDER}║${RESET}"
+  echo -e "  ${C_BORDER}╚${dashes}${RESET}"
+}
+
+sep_box() {
+  local width="${1:-56}"
+  local dashes
+  dashes=$(repeat_char '─' $width)
+  echo -e "  ${C_BORDER}╟${dashes}${RESET}"
+}
+
+box_row()  { echo -e "  ${C_BORDER}║${RESET}  ${1}"; }
+
+# Styled sub-menu selector box
+choice_box() {
+  local title="$1"
+  shift
+  local dashes
+  dashes=$(repeat_char '─' $((50 - ${#title} - 1)))
+  echo -e "\n  ${C_BORDER_LT}┌── ${C_SUBTITLE}${title}${RESET} ${C_BORDER_LT}${dashes}${RESET}"
+  for item in "$@"; do
+    local num="${item%%:*}"
+    local desc="${item#*:}"
+    echo -e "  ${C_BORDER_LT}│${RESET}   ${C_NUM}[${num}]${RESET}  ${C_TEXT}${desc}${RESET}"
+  done
+  echo -e "  ${C_BORDER_LT}└$(repeat_char '─' 52)${RESET}"
+  echo -en "\n  ${C_ACCENT}›${RESET}  "
+}
+
+# Labeled input prompt
+ask() {
+  echo -en "\n  ${C_ACCENT}›${RESET}  ${C_LABEL}${1}:${RESET}  "
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HEADER
+# ═══════════════════════════════════════════════════════════════════════════════
+
 show_header() {
   clear
-  echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
-  echo -e "${BLUE}║                      ${CYAN}FIRE-UX${BLUE}                              ║${NC}"
-  echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "  ${FIRE5}██████╗ ██╗██████╗ ███████╗    ██╗   ██╗██╗  ██╗${RESET}"
+  echo -e "  ${FIRE4}██╔═══╝ ██║██╔══██╗██╔════╝    ██║   ██║╚██╗██╔╝${RESET}"
+  echo -e "  ${FIRE3}█████╗  ██║██████╔╝█████╗      ██║   ██║ ╚███╔╝ ${RESET}"
+  echo -e "  ${FIRE2}██╔══╝  ██║██╔══██╗██╔══╝      ██║   ██║ ██╔██╗ ${RESET}"
+  echo -e "  ${FIRE1}██║     ██║██║  ██║███████╗    ╚██████╔╝██╔╝ ██╗${RESET}"
+  echo -e "  ${FIRE1}╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝    ╚═════╝ ╚═╝  ╚═╝${RESET}"
+  echo ""
+  echo -e "  ${C_BORDER}$(repeat_char '─' 56)${RESET}"
+  echo -e "  ${C_MUTED}Intelligent Firewall Manager  ·  $(date '+%Y-%m-%d  %H:%M:%S')${RESET}"
+  echo -e "  ${C_BORDER}$(repeat_char '─' 56)${RESET}"
   echo ""
 }
 
-# Function to display dashboard
-show_dashboard() {
+# Header with breadcrumb
+show_section() {
   show_header
-  
-  echo -e "${CYAN}╔═══ FIREWALL STATUS ═══╗${NC}"
-  
-  # Default policies
-  echo -e "${YELLOW}Default Policies:${NC}"
-  echo -e "  INPUT: $(iptables -L INPUT | head -n1 | awk '{print $4}')"
-  echo -e "  OUTPUT: $(iptables -L OUTPUT | head -n1 | awk '{print $4}')"
-  echo -e "  FORWARD: $(iptables -L FORWARD | head -n1 | awk '{print $4}')"
-  
-  # Count rules
-  local input_rules=$(iptables -L INPUT -v | tail -n +3 | grep -v "^$" | wc -l)
-  local output_rules=$(iptables -L OUTPUT -v | tail -n +3 | grep -v "^$" | wc -l)
-  local forward_rules=$(iptables -L FORWARD -v | tail -n +3 | grep -v "^$" | wc -l)
-  local total_rules=$((input_rules + output_rules + forward_rules))
-  
-  echo -e "\n${YELLOW}Active Rules:${NC}"
-  echo -e "  INPUT: $input_rules rules"
-  echo -e "  OUTPUT: $output_rules rules"
-  echo -e "  FORWARD: $forward_rules rules"
-  echo -e "  TOTAL: $total_rules rules"
-  
-  # Open ports
-  echo -e "\n${YELLOW}Open Ports:${NC}"
-  local open_tcp_ports=$(iptables -L INPUT -n | grep "tcp dpt:" | sed -E 's/.*dpt:([0-9]+).*/\1/' | sort -n | uniq | tr '\n' ' ')
-  local open_udp_ports=$(iptables -L INPUT -n | grep "udp dpt:" | sed -E 's/.*dpt:([0-9]+).*/\1/' | sort -n | uniq | tr '\n' ' ')
-  
-  if [ -n "$open_tcp_ports" ]; then
-    echo -e "  TCP: $open_tcp_ports"
-  else
-    echo -e "  TCP: None"
-  fi
-  
-  if [ -n "$open_udp_ports" ]; then
-    echo -e "  UDP: $open_udp_ports"
-  else
-    echo -e "  UDP: None"
-  fi
-  
-  # Check for common services
-  echo -e "\n${YELLOW}Allowed Services:${NC}"
-  local services=""
-  
-  if echo "$open_tcp_ports" | grep -q "22"; then
-    services+="SSH (22) "
-  fi
-  if echo "$open_tcp_ports" | grep -q "80"; then
-    services+="HTTP (80) "
-  fi
-  if echo "$open_tcp_ports" | grep -q "443"; then
-    services+="HTTPS (443) "
-  fi
-  if echo "$open_tcp_ports" | grep -q "21"; then
-    services+="FTP (21) "
-  fi
-  if echo "$open_udp_ports" | grep -q "53"; then
-    services+="DNS (53) "
-  fi
-  if echo "$open_udp_ports" | grep -q "51820"; then
-    services+="WireGuard (51820) "
-  fi
-  
-  if [ -n "$services" ]; then
-    echo -e "  $services"
-  else
-    echo -e "  None detected"
-  fi
-  
-  # Recent activity (top 5 rules by packet count)
-  echo -e "\n${YELLOW}Recent Activity (Top 5 Rules):${NC}"
-  iptables -L INPUT -v -n | tail -n +3 | sort -rn -k 1 | head -5 | \
-    awk '{printf "  %s packets (%s bytes) - %s\n", $1, $2, $0}' | \
-    sed -E 's/  [0-9]+ packets $$[0-9]+ bytes$$ - [0-9]+ [0-9]+ //g'
-  
-  # IP Forwarding status
-  echo -e "\n${YELLOW}IP Forwarding Status:${NC}"
-  if [ "$(cat /proc/sys/net/ipv4/ip_forward)" -eq 1 ]; then
-    echo -e "  ${GREEN}Enabled${NC}"
-  else
-    echo -e "  ${RED}Disabled${NC}"
-  fi
-  
-  # Active network routes
-  echo -e "\n${YELLOW}Active Network Routes:${NC}"
-  if [ -d "$ROUTES_DIR" ] && [ "$(ls -A "$ROUTES_DIR" 2>/dev/null)" ]; then
-    for route_file in "$ROUTES_DIR"/*; do
-      if [ -f "$route_file" ]; then
-        route_name=$(basename "$route_file")
-        echo -e "  - $route_name"
-      fi
-    done
-  else
-    echo -e "  None configured"
-  fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+  echo -e "  ${C_MUTED}▸ Main  ▸  ${C_TITLE}${BOLD}${1}${RESET}"
 }
 
-# Function to add a custom rule
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+show_dashboard() {
+  show_section "Dashboard"
+  open_box "FIREWALL STATUS"
+
+  # Default policies
+  local pol_in pol_out pol_fwd
+  pol_in=$(iptables  -L INPUT   2>/dev/null | head -n1 | awk '{print $4}')
+  pol_out=$(iptables -L OUTPUT  2>/dev/null | head -n1 | awk '{print $4}')
+  pol_fwd=$(iptables -L FORWARD 2>/dev/null | head -n1 | awk '{print $4}')
+
+  _policy_color() {
+    case "$1" in
+      ACCEPT) echo "${C_SUCCESS}" ;;
+      DROP|REJECT) echo "${C_ERROR}" ;;
+      *) echo "${C_MUTED}" ;;
+    esac
+  }
+
+  local c_in c_out c_fwd
+  c_in=$(_policy_color  "$pol_in")
+  c_out=$(_policy_color "$pol_out")
+  c_fwd=$(_policy_color "$pol_fwd")
+
+  box_row "${C_SUBTITLE}Default Policies${RESET}"
+  box_row "  ${C_LABEL}INPUT   ${RESET}${c_in}${BOLD}${pol_in:-?}${RESET}     ${C_LABEL}OUTPUT  ${RESET}${c_out}${BOLD}${pol_out:-?}${RESET}     ${C_LABEL}FORWARD ${RESET}${c_fwd}${BOLD}${pol_fwd:-?}${RESET}"
+  echo -e "  ${C_BORDER}║${RESET}"
+
+  # Rule counts
+  local cnt_in cnt_out cnt_fwd cnt_total
+  cnt_in=$(iptables  -L INPUT   -v 2>/dev/null | tail -n +3 | grep -v "^$" | wc -l)
+  cnt_out=$(iptables -L OUTPUT  -v 2>/dev/null | tail -n +3 | grep -v "^$" | wc -l)
+  cnt_fwd=$(iptables -L FORWARD -v 2>/dev/null | tail -n +3 | grep -v "^$" | wc -l)
+  cnt_total=$((cnt_in + cnt_out + cnt_fwd))
+
+  box_row "${C_SUBTITLE}Active Rules${RESET}"
+  box_row "  ${C_LABEL}INPUT  ${C_NUM}${cnt_in}${RESET}    ${C_LABEL}OUTPUT  ${C_NUM}${cnt_out}${RESET}    ${C_LABEL}FORWARD  ${C_NUM}${cnt_fwd}${RESET}    ${C_MUTED}·  ${C_NUM}${cnt_total}${C_MUTED} total${RESET}"
+  echo -e "  ${C_BORDER}║${RESET}"
+
+  # Open ports
+  local tcp_ports udp_ports
+  tcp_ports=$(iptables -L INPUT -n 2>/dev/null | grep "tcp dpt:" | sed -E 's/.*dpt:([0-9]+).*/\1/' | sort -n | uniq | tr '\n' '  ')
+  udp_ports=$(iptables -L INPUT -n 2>/dev/null | grep "udp dpt:" | sed -E 's/.*dpt:([0-9]+).*/\1/' | sort -n | uniq | tr '\n' '  ')
+
+  box_row "${C_SUBTITLE}Open Ports${RESET}"
+  box_row "  ${C_LABEL}TCP${RESET}  ${C_TEXT}${tcp_ports:-${C_MUTED}none}${RESET}"
+  box_row "  ${C_LABEL}UDP${RESET}  ${C_TEXT}${udp_ports:-${C_MUTED}none}${RESET}"
+  echo -e "  ${C_BORDER}║${RESET}"
+
+  # Detected services
+  local services=""
+  echo "$tcp_ports" | grep -q '\b22\b'    && services+="${C_SUCCESS}● SSH     ${RESET}"
+  echo "$tcp_ports" | grep -q '\b80\b'    && services+="${C_SUCCESS}● HTTP    ${RESET}"
+  echo "$tcp_ports" | grep -q '\b443\b'   && services+="${C_SUCCESS}● HTTPS   ${RESET}"
+  echo "$tcp_ports" | grep -q '\b21\b'    && services+="${C_SUCCESS}● FTP     ${RESET}"
+  echo "$tcp_ports" | grep -q '\b25\b'    && services+="${C_SUCCESS}● SMTP    ${RESET}"
+  echo "$udp_ports" | grep -q '\b53\b'    && services+="${C_SUCCESS}● DNS     ${RESET}"
+  echo "$udp_ports" | grep -q '\b51820\b' && services+="${C_SUCCESS}● WG      ${RESET}"
+
+  box_row "${C_SUBTITLE}Detected Services${RESET}"
+  box_row "  ${services:-${C_MUTED}none detected}${RESET}"
+  echo -e "  ${C_BORDER}║${RESET}"
+
+  # IP forwarding
+  local ip_fwd
+  ip_fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+  local fwd_label fwd_color
+  if [ "${ip_fwd}" = "1" ]; then
+    fwd_label="ENABLED"; fwd_color="${C_SUCCESS}"
+  else
+    fwd_label="DISABLED"; fwd_color="${C_ERROR}"
+  fi
+  box_row "${C_SUBTITLE}IP Forwarding${RESET}  ${fwd_color}${BOLD}${fwd_label}${RESET}"
+  echo -e "  ${C_BORDER}║${RESET}"
+
+  # Active routes
+  box_row "${C_SUBTITLE}Saved Routes${RESET}"
+  if [ -d "$ROUTES_DIR" ] && [ "$(ls -A "$ROUTES_DIR" 2>/dev/null)" ]; then
+    for rf in "$ROUTES_DIR"/*; do
+      [ -f "$rf" ] && box_row "  ${C_ACCENT}·${RESET}  $(basename "$rf")"
+    done
+  else
+    box_row "  ${C_MUTED}none configured${RESET}"
+  fi
+
+  close_box
+
+  press_enter
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADD CUSTOM RULE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 add_custom_rule() {
-  show_header
-  echo -e "${CYAN}╔═══ ADD CUSTOM RULE ═══╗${NC}"
-  
-  # Choose chain
-  echo -e "${YELLOW}Select chain:${NC}"
-  echo "1) INPUT (incoming traffic)"
-  echo "2) OUTPUT (outgoing traffic)"
-  echo "3) FORWARD (traffic being routed)"
-  echo -e "${BLUE}Enter your choice (1-3):${NC} "
+  show_section "Add Custom Rule"
+
+  # Chain
+  choice_box "Select chain" \
+    "1:INPUT    — Incoming traffic" \
+    "2:OUTPUT   — Outgoing traffic" \
+    "3:FORWARD  — Routed traffic"
   read -r chain_choice
-  
   case $chain_choice in
     1) chain="INPUT" ;;
     2) chain="OUTPUT" ;;
     3) chain="FORWARD" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  # Choose protocol
-  echo -e "\n${YELLOW}Select protocol:${NC}"
-  echo "1) TCP"
-  echo "2) UDP"
-  echo "3) Both (TCP and UDP)"
-  echo "4) ICMP (ping)"
-  echo "5) All protocols"
-  echo -e "${BLUE}Enter your choice (1-5):${NC} "
+
+  # Protocol
+  choice_box "Select protocol" \
+    "1:TCP" \
+    "2:UDP" \
+    "3:Both  (TCP and UDP)" \
+    "4:ICMP  (ping)" \
+    "5:All protocols"
   read -r protocol_choice
-  
   case $protocol_choice in
     1) protocol="tcp" ;;
     2) protocol="udp" ;;
     3) protocol="all" ;;
     4) protocol="icmp" ;;
     5) protocol="all" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  # Port (if TCP or UDP)
+
+  # Port
   port=""
   if [ "$protocol" = "tcp" ] || [ "$protocol" = "udp" ]; then
-    echo -e "\n${YELLOW}Enter port number or service name:${NC}"
-    echo "Examples: 22 (SSH), 80 (HTTP), 443 (HTTPS), etc."
-    echo -e "${BLUE}Port/Service:${NC} "
+    ask "Port or service  (e.g. 22, 80, 443)"
     read -r port
-    
     if ! [[ "$port" =~ ^[0-9]+$ ]] && ! grep -q "^$port" /etc/services; then
-      echo -e "${RED}Invalid port or service. Returning to main menu.${NC}"
-      sleep 2
-      return
+      msg_err "Invalid port or service."; sleep 2; return
     fi
   fi
-  
-  # Source IP address
-  echo -e "\n${YELLOW}Enter source IP address:${NC}"
-  echo "Examples: 192.168.1.10, 10.0.0.0/8, or leave empty for any"
-  echo -e "${BLUE}Source IP:${NC} "
+
+  # Source IP
+  ask "Source IP  (leave empty for any)"
   read -r source_ip
-  
-  # If empty, use any
-  if [ -z "$source_ip" ]; then
-    source_ip="0.0.0.0/0"
-  fi
-  
+  [ -z "$source_ip" ] && source_ip="0.0.0.0/0"
+
   # Action
-  echo -e "\n${YELLOW}Select action:${NC}"
-  echo "1) ACCEPT (allow traffic)"
-  echo "2) DROP (silently discard traffic)"
-  echo "3) REJECT (discard and send error message)"
-  echo -e "${BLUE}Enter your choice (1-3):${NC} "
+  choice_box "Select action" \
+    "1:ACCEPT  — Allow traffic" \
+    "2:DROP    — Silently discard" \
+    "3:REJECT  — Discard and send error"
   read -r action_choice
-  
   case $action_choice in
     1) action="ACCEPT" ;;
     2) action="DROP" ;;
     3) action="REJECT" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  # Temporary rule?
-  echo -e "\n${YELLOW}Is this a temporary rule?${NC}"
-  echo "1) No (permanent)"
-  echo "2) Yes (will be removed after system reboot)"
-  echo "3) Timed (specify duration in minutes)"
-  echo -e "${BLUE}Enter your choice (1-3):${NC} "
+
+  # Persistence
+  choice_box "Rule lifetime" \
+    "1:Permanent  — survives reboot" \
+    "2:Temporary  — removed on reboot" \
+    "3:Timed      — specify duration in minutes"
   read -r temp_choice
-  
-  # Build the iptables command
+
+  # Build command
   cmd="iptables -A $chain"
-  
-  if [ "$protocol" != "all" ]; then
-    cmd="$cmd -p $protocol"
-  fi
-  
-  if [ -n "$port" ] && [ "$protocol" != "icmp" ]; then
-    cmd="$cmd --dport $port"
-  fi
-  
-  if [ "$source_ip" != "0.0.0.0/0" ]; then
-    cmd="$cmd -s $source_ip"
-  fi
-  
+  [ "$protocol" != "all" ]     && cmd="$cmd -p $protocol"
+  [ -n "$port" ] && [ "$protocol" != "icmp" ] && cmd="$cmd --dport $port"
+  [ "$source_ip" != "0.0.0.0/0" ] && cmd="$cmd -s $source_ip"
   cmd="$cmd -j $action"
-  
-  # Confirm rule
-  echo -e "\n${YELLOW}Rule to be added:${NC}"
-  echo -e "${GREEN}$cmd${NC}"
-  echo -e "\n${BLUE}Confirm? (y/n):${NC} "
-  read -r confirm
-  
-  if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    # Execute the command
-    eval "$cmd"
-    
-    if [ $? -eq 0 ]; then
-      echo -e "${GREEN}Rule added successfully!${NC}"
-      log_action "Added rule: $cmd"
-      
-      # Handle temporary rule
-      if [ "$temp_choice" = "3" ]; then
-        echo -e "\n${YELLOW}Enter duration in minutes:${NC} "
-        read -r duration
-        
-        if [[ "$duration" =~ ^[0-9]+$ ]]; then
-          # Create a background job to remove the rule after the specified time
-          (
-            sleep $((duration * 60))
-            # Find and delete the rule (this is a simplified approach)
-            rule_num=$(iptables -L $chain --line-numbers | grep "$action" | tail -1 | awk '{print $1}')
-            if [ -n "$rule_num" ]; then
-              iptables -D $chain $rule_num
-              log_action "Removed temporary rule after $duration minutes: $cmd"
-            fi
-          ) &
-          echo -e "${GREEN}Rule will be automatically removed after $duration minutes.${NC}"
-        else
-          echo -e "${RED}Invalid duration. Rule added as permanent.${NC}"
-        fi
+
+  echo -e "\n  ${C_BORDER_LT}$(repeat_char '─' 54)${RESET}"
+  echo -e "  ${C_SUBTITLE}Rule preview:${RESET}  ${C_HIGHLIGHT}${cmd}${RESET}"
+  echo -e "  ${C_BORDER_LT}$(repeat_char '─' 54)${RESET}"
+
+  ask_confirm "Apply this rule?" || { msg_warn "Cancelled."; press_enter; return; }
+
+  eval "$cmd"
+  if [ $? -eq 0 ]; then
+    msg_ok "Rule added successfully!"
+    log_action "Added rule: $cmd"
+
+    if [ "$temp_choice" = "3" ]; then
+      ask "Duration in minutes"
+      read -r duration
+      if [[ "$duration" =~ ^[0-9]+$ ]]; then
+        (
+          sleep $((duration * 60))
+          rule_num=$(iptables -L "$chain" --line-numbers | grep "$action" | tail -1 | awk '{print $1}')
+          [ -n "$rule_num" ] && iptables -D "$chain" "$rule_num"
+          log_action "Auto-removed timed rule after ${duration}m: $cmd"
+        ) &
+        msg_info "Rule will be removed automatically after ${duration} minutes."
+      else
+        msg_warn "Invalid duration — rule added as permanent."
       fi
-      
-      # Save if permanent
-      if [ "$temp_choice" = "1" ]; then
-        if command -v iptables-save > /dev/null; then
-            if command -v iptables-save > /dev/null; then
-              iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-            else
-            echo -e "${YELLOW}Warning: iptables-save not found. Rules may not persist after reboot.${NC}"
-          fi
-          echo -e "${GREEN}Rules saved permanently.${NC}"
-        else
-          echo -e "${YELLOW}Warning: iptables-save not found. Rule may not persist after reboot.${NC}"
-        fi
+    fi
+
+    if [ "$temp_choice" = "1" ]; then
+      if command -v iptables-save > /dev/null; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
+        msg_ok "Rules saved permanently."
+      else
+        msg_warn "iptables-save not found — rule may not persist after reboot."
       fi
-    else
-      echo -e "${RED}Failed to add rule.${NC}"
     fi
   else
-    echo -e "${YELLOW}Operation cancelled.${NC}"
+    msg_err "Failed to add rule."
   fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Function to delete rules
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DELETE RULES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 delete_rules() {
-  show_header
-  echo -e "${CYAN}╔═══ DELETE RULES ═══╗${NC}"
-  
-  echo -e "${YELLOW}Select option:${NC}"
-  echo "1) Delete specific rule"
-  echo "2) Delete all rules in a chain"
-  echo "3) Reset firewall (delete all rules)"
-  echo "4) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-4):${NC} "
+  show_section "Delete Rules"
+
+  choice_box "Select operation" \
+    "1:Delete specific rule" \
+    "2:Flush a chain  (all rules)" \
+    "3:Full reset  (all rules + policies)" \
+    "4:Back to main menu"
   read -r delete_choice
-  
+
   case $delete_choice in
     1)
-      # Delete specific rule
-      echo -e "\n${YELLOW}Select chain:${NC}"
-      echo "1) INPUT"
-      echo "2) OUTPUT"
-      echo "3) FORWARD"
-      echo -e "${BLUE}Enter your choice (1-3):${NC} "
+      choice_box "Select chain" \
+        "1:INPUT" "2:OUTPUT" "3:FORWARD"
       read -r chain_choice
-      
       case $chain_choice in
-        1) chain="INPUT" ;;
-        2) chain="OUTPUT" ;;
-        3) chain="FORWARD" ;;
-        *) 
-          echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-          sleep 2
-          return
-          ;;
+        1) chain="INPUT" ;; 2) chain="OUTPUT" ;; 3) chain="FORWARD" ;;
+        *) msg_err "Invalid choice."; sleep 2; return ;;
       esac
-      
-      # Show rules with line numbers
-      echo -e "\n${YELLOW}Current rules in $chain chain:${NC}"
-      iptables -L $chain --line-numbers
-      
-      echo -e "\n${YELLOW}Enter rule number to delete:${NC} "
+
+      echo ""
+      echo -e "  ${C_SUBTITLE}Current rules in ${C_TITLE}${chain}${RESET}${C_SUBTITLE}:${RESET}"
+      echo -e "  ${C_BORDER}$(repeat_char '─' 54)${RESET}"
+      iptables -L "$chain" --line-numbers -n 2>/dev/null | while IFS= read -r line; do
+        echo -e "  ${C_MUTED}${line}${RESET}"
+      done
+      echo -e "  ${C_BORDER}$(repeat_char '─' 54)${RESET}"
+
+      ask "Rule number to delete"
       read -r rule_num
-      
       if [[ "$rule_num" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Warning: This will delete rule #$rule_num from the $chain chain.${NC}"
-        echo -e "${BLUE}Confirm? (y/n):${NC} "
-        read -r confirm
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-          iptables -D $chain $rule_num
-          
-          if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Rule deleted successfully!${NC}"
-            log_action "Deleted rule #$rule_num from $chain chain"
-            
-            # Save changes
-            if command -v iptables-save > /dev/null; then
-              iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-            fi
-          else
-            echo -e "${RED}Failed to delete rule.${NC}"
-          fi
+        msg_warn "This will delete rule #${rule_num} from ${chain}."
+        ask_confirm "Proceed?" || { msg_warn "Cancelled."; press_enter; return; }
+        iptables -D "$chain" "$rule_num"
+        if [ $? -eq 0 ]; then
+          msg_ok "Rule #${rule_num} deleted."
+          log_action "Deleted rule #$rule_num from $chain"
+          command -v iptables-save > /dev/null && \
+            { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
         else
-          echo -e "${YELLOW}Operation cancelled.${NC}"
+          msg_err "Failed to delete rule."
         fi
       else
-        echo -e "${RED}Invalid rule number.${NC}"
+        msg_err "Invalid rule number."
       fi
       ;;
-      
+
     2)
-      # Delete all rules in a chain
-      echo -e "\n${YELLOW}Select chain to flush:${NC}"
-      echo "1) INPUT"
-      echo "2) OUTPUT"
-      echo "3) FORWARD"
-      echo "4) All chains"
-      echo -e "${BLUE}Enter your choice (1-4):${NC} "
+      choice_box "Select chain to flush" \
+        "1:INPUT" "2:OUTPUT" "3:FORWARD" "4:All chains"
       read -r chain_choice
-      
       case $chain_choice in
-        1) chain="INPUT" ;;
-        2) chain="OUTPUT" ;;
-        3) chain="FORWARD" ;;
-        4) chain="all" ;;
-        *) 
-          echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-          sleep 2
-          return
-          ;;
+        1) chain="INPUT" ;; 2) chain="OUTPUT" ;; 3) chain="FORWARD" ;; 4) chain="all" ;;
+        *) msg_err "Invalid choice."; sleep 2; return ;;
       esac
-      
-      echo -e "${RED}Warning: This will delete ALL rules in the $chain chain.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if [ "$chain" = "all" ]; then
-          iptables -F
-          echo -e "${GREEN}All chains flushed successfully!${NC}"
-          log_action "Flushed all chains"
-        else
-          iptables -F $chain
-          echo -e "${GREEN}$chain chain flushed successfully!${NC}"
-          log_action "Flushed $chain chain"
-        fi
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
-      ;;
-      
-    3)
-      # Reset firewall
-      echo -e "${RED}WARNING: This will delete ALL rules, chains, and reset default policies.${NC}"
-      echo -e "${RED}You may lose network connectivity if you don't have proper default rules.${NC}"
-      echo -e "${BLUE}Are you ABSOLUTELY sure? (type 'RESET' to confirm):${NC} "
-      read -r confirm
-      
-      if [ "$confirm" = "RESET" ]; then
-        # Save current rules first
-        local timestamp=$(date +%Y%m%d%H%M%S)
-        local backup_file="$PROFILES_DIR/backup_before_reset_$timestamp"
-        
-        iptables-save > "$backup_file"
-        
-        # Reset everything
+
+      msg_warn "All rules in ${chain} will be deleted."
+      ask_confirm "Proceed?" || { msg_warn "Cancelled."; press_enter; return; }
+
+      if [ "$chain" = "all" ]; then
         iptables -F
-        iptables -X
-        iptables -t nat -F
-        iptables -t nat -X
-        iptables -t mangle -F
-        iptables -t mangle -X
-        
-        # Set default policies to ACCEPT
-        iptables -P INPUT ACCEPT
-        iptables -P OUTPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        
-        echo -e "${GREEN}Firewall reset successfully!${NC}"
-        echo -e "${YELLOW}Backup saved to $backup_file${NC}"
-        log_action "Reset firewall (backup saved to $backup_file)"
-        
-        # Add basic rules to prevent lockout
-        echo -e "${YELLOW}Would you like to add basic safety rules? (y/n):${NC} "
-        read -r add_safety
-        
-        if [[ "$add_safety" =~ ^[Yy]$ ]]; then
-          # Allow loopback
-          iptables -A INPUT -i lo -j ACCEPT
-          
-          # Allow established connections
-          iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-          
-          # Allow SSH
-          iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-          
-          # Set default policies
-          iptables -P INPUT DROP
-          iptables -P FORWARD DROP
-          iptables -P OUTPUT ACCEPT
-          
-          echo -e "${GREEN}Basic safety rules added.${NC}"
-          log_action "Added basic safety rules after reset"
-          
-          # Save changes
-          if command -v iptables-save > /dev/null; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-          fi
-        fi
+        msg_ok "All chains flushed."
+        log_action "Flushed all chains"
       else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
+        iptables -F "$chain"
+        msg_ok "${chain} chain flushed."
+        log_action "Flushed $chain chain"
+      fi
+      command -v iptables-save > /dev/null && \
+        { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
+      ;;
+
+    3)
+      echo -e "\n  ${C_ERROR}${BOLD}  ██  FULL RESET WARNING${RESET}"
+      echo -e "  ${C_ERROR}  All rules, custom chains, and policies will be wiped.${RESET}"
+      echo -e "  ${C_ERROR}  You may lose network access if no safety rules are added.${RESET}"
+      echo -en "\n  ${C_WARN}${BOLD}?${RESET}  ${C_TEXT}Type ${C_KEY}RESET${C_TEXT} to confirm:${RESET}  "
+      read -r confirm
+      if [ "$confirm" = "RESET" ]; then
+        local ts; ts=$(date +%Y%m%d%H%M%S)
+        local bk="$PROFILES_DIR/backup_before_reset_$ts"
+        iptables-save > "$bk"
+
+        iptables -F; iptables -X
+        iptables -t nat -F; iptables -t nat -X
+        iptables -t mangle -F; iptables -t mangle -X
+        iptables -P INPUT ACCEPT; iptables -P OUTPUT ACCEPT; iptables -P FORWARD ACCEPT
+
+        msg_ok "Firewall reset."
+        msg_info "Backup saved: ${bk}"
+        log_action "Reset firewall (backup: $bk)"
+
+        ask_confirm "Add basic safety rules now? (lo, ESTABLISHED, SSH, DROP rest)" && {
+          iptables -A INPUT -i lo -j ACCEPT
+          iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+          iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
+          msg_ok "Basic safety rules applied."
+          log_action "Added basic safety rules after reset"
+          command -v iptables-save > /dev/null && \
+            { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
+        }
+      else
+        msg_warn "Reset cancelled."
       fi
       ;;
-      
-    4)
-      # Back to main menu
-      return
-      ;;
-      
-    *)
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+
+    4) return ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Function to save and restore profiles
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PROFILE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 manage_profiles() {
-  show_header
-  echo -e "${CYAN}╔═══ PROFILE MANAGEMENT ═══╗${NC}"
-  
-  echo -e "${YELLOW}Select option:${NC}"
-  echo "1) Save current rules as profile"
-  echo "2) Load profile"
-  echo "3) Delete profile"
-  echo "4) List available profiles"
-  echo "5) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-5):${NC} "
+  show_section "Profile Management"
+
+  choice_box "Select operation" \
+    "1:Save current rules as profile" \
+    "2:Load a profile" \
+    "3:Delete a profile" \
+    "4:List profiles" \
+    "5:Back to main menu"
   read -r profile_choice
-  
+
   case $profile_choice in
     1)
-      # Save profile
-      echo -e "\n${YELLOW}Enter profile name:${NC} "
+      ask "Profile name"
       read -r profile_name
-      
-      if [ -z "$profile_name" ]; then
-        echo -e "${RED}Profile name cannot be empty.${NC}"
-      else
-        # Sanitize profile name
-        profile_name=$(echo "$profile_name" | tr -cd '[:alnum:]._-')
-        profile_file="$PROFILES_DIR/$profile_name"
-        
-        # Check if profile already exists
-        if [ -f "$profile_file" ]; then
-          echo -e "${YELLOW}Profile already exists. Overwrite? (y/n):${NC} "
-          read -r overwrite
-          
-          if ! [[ "$overwrite" =~ ^[Yy]$ ]]; then
-            echo -e "${YELLOW}Operation cancelled.${NC}"
-            echo -e "\n${BLUE}Press Enter to continue...${NC}"
-            read
-            return
-          fi
-        fi
-        
-        # Save rules to profile
-        iptables-save > "$profile_file"
-        
-        if [ $? -eq 0 ]; then
-          echo -e "${GREEN}Profile saved successfully!${NC}"
-          log_action "Saved profile: $profile_name"
-        else
-          echo -e "${RED}Failed to save profile.${NC}"
-        fi
+      [ -z "$profile_name" ] && { msg_err "Name cannot be empty."; press_enter; return; }
+      profile_name=$(echo "$profile_name" | tr -cd '[:alnum:]._-')
+      local pf="$PROFILES_DIR/$profile_name"
+      if [ -f "$pf" ]; then
+        ask_confirm "Profile already exists. Overwrite?" || { msg_warn "Cancelled."; press_enter; return; }
       fi
+      iptables-save > "$pf"
+      [ $? -eq 0 ] && { msg_ok "Profile '${profile_name}' saved."; log_action "Saved profile: $profile_name"; } \
+                   || msg_err "Failed to save profile."
       ;;
-      
+
     2)
-      # Load profile
-      echo -e "\n${YELLOW}Available profiles:${NC}"
-      ls -1 "$PROFILES_DIR" 2>/dev/null
-      
-      echo -e "\n${YELLOW}Enter profile name to load:${NC} "
+      echo -e "\n  ${C_SUBTITLE}Available profiles:${RESET}"
+      ls -1 "$PROFILES_DIR" 2>/dev/null | while read -r p; do
+        echo -e "  ${C_ACCENT}·${RESET}  ${C_TEXT}${p}${RESET}"
+      done
+      ask "Profile name to load"
       read -r profile_name
-      
-      profile_file="$PROFILES_DIR/$profile_name"
-      
-      if [ -f "$profile_file" ]; then
-        echo -e "${RED}Warning: This will replace all current rules.${NC}"
-        echo -e "${BLUE}Confirm? (y/n):${NC} "
-        read -r confirm
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-          # Backup current rules
-          local timestamp=$(date +%Y%m%d%H%M%S)
-          local backup_file="$PROFILES_DIR/backup_before_load_$timestamp"
-          iptables-save > "$backup_file"
-          
-          # Load profile
-          iptables-restore < "$profile_file"
-          
-          if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Profile loaded successfully!${NC}"
-            log_action "Loaded profile: $profile_name"
-            
-            # Save changes
-            if command -v iptables-save > /dev/null; then
-              iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-            fi
-          else
-            echo -e "${RED}Failed to load profile.${NC}"
-            echo -e "${YELLOW}Restoring previous rules...${NC}"
-            iptables-restore < "$backup_file"
-          fi
+      local pf="$PROFILES_DIR/$profile_name"
+      if [ -f "$pf" ]; then
+        msg_warn "This will replace all current rules."
+        ask_confirm "Proceed?" || { msg_warn "Cancelled."; press_enter; return; }
+        local ts; ts=$(date +%Y%m%d%H%M%S)
+        local bk="$PROFILES_DIR/backup_before_load_$ts"
+        iptables-save > "$bk"
+        iptables-restore < "$pf"
+        if [ $? -eq 0 ]; then
+          msg_ok "Profile '${profile_name}' loaded."
+          log_action "Loaded profile: $profile_name"
+          command -v iptables-save > /dev/null && \
+            { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
         else
-          echo -e "${YELLOW}Operation cancelled.${NC}"
+          msg_err "Failed to load profile. Restoring backup..."
+          iptables-restore < "$bk"
         fi
       else
-        echo -e "${RED}Profile not found.${NC}"
+        msg_err "Profile not found."
       fi
       ;;
-      
+
     3)
-      # Delete profile
-      echo -e "\n${YELLOW}Available profiles:${NC}"
-      ls -1 "$PROFILES_DIR" 2>/dev/null
-      
-      echo -e "\n${YELLOW}Enter profile name to delete:${NC} "
+      echo -e "\n  ${C_SUBTITLE}Available profiles:${RESET}"
+      ls -1 "$PROFILES_DIR" 2>/dev/null | while read -r p; do
+        echo -e "  ${C_ACCENT}·${RESET}  ${C_TEXT}${p}${RESET}"
+      done
+      ask "Profile name to delete"
       read -r profile_name
-      
-      profile_file="$PROFILES_DIR/$profile_name"
-      
-      if [ -f "$profile_file" ]; then
-        echo -e "${RED}Warning: This will permanently delete the profile.${NC}"
-        echo -e "${BLUE}Confirm? (y/n):${NC} "
-        read -r confirm
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-          rm "$profile_file"
-          
-          if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Profile deleted successfully!${NC}"
-            log_action "Deleted profile: $profile_name"
-          else
-            echo -e "${RED}Failed to delete profile.${NC}"
-          fi
-        else
-          echo -e "${YELLOW}Operation cancelled.${NC}"
-        fi
+      local pf="$PROFILES_DIR/$profile_name"
+      if [ -f "$pf" ]; then
+        msg_warn "This will permanently delete '${profile_name}'."
+        ask_confirm "Proceed?" || { msg_warn "Cancelled."; press_enter; return; }
+        rm "$pf"
+        [ $? -eq 0 ] && { msg_ok "Profile deleted."; log_action "Deleted profile: $profile_name"; } \
+                     || msg_err "Failed to delete profile."
       else
-        echo -e "${RED}Profile not found.${NC}"
+        msg_err "Profile not found."
       fi
       ;;
-      
+
     4)
-      # List profiles
-      echo -e "\n${YELLOW}Available profiles:${NC}"
-      
-      if [ -d "$PROFILES_DIR" ]; then
-        profiles=$(ls -1 "$PROFILES_DIR" 2>/dev/null)
-        
-        if [ -z "$profiles" ]; then
-          echo -e "${BLUE}No profiles found.${NC}"
-        else
-          echo -e "${BLUE}$profiles${NC}"
-        fi
+      echo ""
+      local profiles
+      profiles=$(ls -1 "$PROFILES_DIR" 2>/dev/null)
+      if [ -z "$profiles" ]; then
+        msg_info "No profiles found."
       else
-        echo -e "${BLUE}No profiles found.${NC}"
+        echo -e "  ${C_SUBTITLE}Saved profiles:${RESET}"
+        echo -e "  ${C_BORDER}$(repeat_char '─' 40)${RESET}"
+        echo "$profiles" | while read -r p; do
+          local size; size=$(du -sh "$PROFILES_DIR/$p" 2>/dev/null | awk '{print $1}')
+          echo -e "  ${C_ACCENT}·${RESET}  ${C_TEXT}${p}${RESET}  ${C_MUTED}(${size})${RESET}"
+        done
+        echo -e "  ${C_BORDER}$(repeat_char '─' 40)${RESET}"
       fi
       ;;
-      
-    5)
-      # Back to main menu
-      return
-      ;;
-      
-    *)
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+
+    5) return ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Function to quickly enable/disable firewall
+# ═══════════════════════════════════════════════════════════════════════════════
+#  QUICK TOGGLE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 quick_toggle() {
-  show_header
-  echo -e "${CYAN}╔═══ QUICK TOGGLE ═══╗${NC}"
-  
-  echo -e "${YELLOW}Select option:${NC}"
-  echo "1) Enable enhanced security (block all except essential services)"
-  echo "2) Maintenance mode (allow all traffic temporarily)"
-  echo "3) Restore previous rules"
-  echo "4) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-4):${NC} "
+  show_section "Quick Toggle"
+
+  choice_box "Select mode" \
+    "1:Enhanced Security  — block all except SSH + ESTABLISHED" \
+    "2:Maintenance Mode   — allow all traffic temporarily" \
+    "3:Restore Backup     — roll back to a previous state" \
+    "4:Back to main menu"
   read -r toggle_choice
-  
+
+  local ts; ts=$(date +%Y%m%d%H%M%S)
+
   case $toggle_choice in
     1)
-      # Enhanced security
-      echo -e "${YELLOW}This will block all incoming traffic except SSH and established connections.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Backup current rules
-        local timestamp=$(date +%Y%m%d%H%M%S)
-        local backup_file="$PROFILES_DIR/backup_before_enhanced_$timestamp"
-        iptables-save > "$backup_file"
-        
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        echo -e "${GREEN}Enhanced security mode enabled!${NC}"
-        echo -e "${YELLOW}Backup saved to $backup_file${NC}"
-        log_action "Enabled enhanced security mode (backup saved to $backup_file)"
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      msg_info "All incoming traffic except SSH and ESTABLISHED will be blocked."
+      ask_confirm "Enable enhanced security?" || { msg_warn "Cancelled."; press_enter; return; }
+
+      local bk="$PROFILES_DIR/backup_before_enhanced_$ts"
+      iptables-save > "$bk"
+      iptables -F; iptables -X
+      iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+      msg_ok "Enhanced security mode active."
+      msg_info "Backup: ${bk}"
+      log_action "Enhanced security enabled (backup: $bk)"
       ;;
-      
+
     2)
-      # Maintenance mode
-      echo -e "${YELLOW}Enter duration in minutes (0 for indefinite):${NC} "
+      ask "Duration in minutes  (0 = indefinite)"
       read -r duration
-      
       if ! [[ "$duration" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid duration.${NC}"
-        echo -e "\n${BLUE}Press Enter to continue...${NC}"
-        read
-        return
+        msg_err "Invalid duration."; press_enter; return
       fi
-      
-      echo -e "${RED}Warning: This will allow ALL traffic to your system.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Backup current rules
-        local timestamp=$(date +%Y%m%d%H%M%S)
-        local backup_file="$PROFILES_DIR/backup_before_maintenance_$timestamp"
-        iptables-save > "$backup_file"
-        
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies to ACCEPT
-        iptables -P INPUT ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-        
-        echo -e "${GREEN}Maintenance mode enabled!${NC}"
-        echo -e "${YELLOW}Backup saved to $backup_file${NC}"
-        log_action "Enabled maintenance mode (backup saved to $backup_file)"
-        
-        if [ "$duration" -gt 0 ]; then
-          echo -e "${YELLOW}Maintenance mode will be disabled after $duration minutes.${NC}"
-          
-          # Create a background job to restore rules after the specified time
-          (
-            sleep $((duration * 60))
-            iptables-restore < "$backup_file"
-            log_action "Automatically disabled maintenance mode after $duration minutes"
-          ) &
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
+
+      msg_warn "All traffic will be allowed. Use only in trusted environments."
+      ask_confirm "Enable maintenance mode?" || { msg_warn "Cancelled."; press_enter; return; }
+
+      local bk="$PROFILES_DIR/backup_before_maintenance_$ts"
+      iptables-save > "$bk"
+      iptables -F; iptables -X
+      iptables -P INPUT ACCEPT; iptables -P FORWARD ACCEPT; iptables -P OUTPUT ACCEPT
+
+      msg_ok "Maintenance mode enabled."
+      msg_info "Backup: ${bk}"
+      log_action "Maintenance mode enabled (backup: $bk)"
+
+      if [ "$duration" -gt 0 ]; then
+        msg_info "Will auto-revert in ${duration} minutes."
+        ( sleep $((duration * 60))
+          iptables-restore < "$bk"
+          log_action "Maintenance mode auto-disabled after ${duration}m"
+        ) &
       fi
       ;;
-      
+
     3)
-      # Restore previous rules
-      echo -e "\n${YELLOW}Available backups:${NC}"
-      ls -1 "$PROFILES_DIR" | grep "backup_" 2>/dev/null
-      
-      echo -e "\n${YELLOW}Enter backup name to restore:${NC} "
+      echo -e "\n  ${C_SUBTITLE}Available backups:${RESET}"
+      ls -1 "$PROFILES_DIR" 2>/dev/null | grep "^backup_" | while read -r b; do
+        echo -e "  ${C_ACCENT}·${RESET}  ${C_TEXT}${b}${RESET}"
+      done
+      ask "Backup name to restore"
       read -r backup_name
-      
-      backup_file="$PROFILES_DIR/$backup_name"
-      
-      if [ -f "$backup_file" ]; then
-        echo -e "${RED}Warning: This will replace all current rules.${NC}"
-        echo -e "${BLUE}Confirm? (y/n):${NC} "
-        read -r confirm
-        
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-          # Backup current rules
-          local timestamp=$(date +%Y%m%d%H%M%S)
-          local current_backup="$PROFILES_DIR/backup_before_restore_$timestamp"
-          iptables-save > "$current_backup"
-          
-          # Restore backup
-          iptables-restore < "$backup_file"
-          
-          if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Rules restored successfully!${NC}"
-            log_action "Restored rules from backup: $backup_name"
-            
-            # Save changes
-            if command -v iptables-save > /dev/null; then
-              iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-            fi
-          else
-            echo -e "${RED}Failed to restore rules.${NC}"
-            echo -e "${YELLOW}Restoring previous rules...${NC}"
-            iptables-restore < "$current_backup"
-          fi
+      local bk="$PROFILES_DIR/$backup_name"
+      if [ -f "$bk" ]; then
+        msg_warn "Current rules will be replaced."
+        ask_confirm "Proceed?" || { msg_warn "Cancelled."; press_enter; return; }
+
+        local cur="$PROFILES_DIR/backup_before_restore_$ts"
+        iptables-save > "$cur"
+        iptables-restore < "$bk"
+        if [ $? -eq 0 ]; then
+          msg_ok "Rules restored from '${backup_name}'."
+          log_action "Restored from backup: $backup_name"
+          command -v iptables-save > /dev/null && \
+            { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
         else
-          echo -e "${YELLOW}Operation cancelled.${NC}"
+          msg_err "Restore failed. Rolling back..."
+          iptables-restore < "$cur"
         fi
       else
-        echo -e "${RED}Backup not found.${NC}"
+        msg_err "Backup not found."
       fi
       ;;
-      
-    4)
-      # Back to main menu
-      return
-      ;;
-      
-    *)
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
-  esac
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
-}
 
-# Function to set default policies
-set_default_policies() {
-  show_header
-  echo -e "${CYAN}╔═══ DEFAULT POLICIES ═══╗${NC}"
-  
-  echo -e "${YELLOW}Current default policies:${NC}"
-  echo -e "  INPUT: $(iptables -L INPUT | head -n1 | awk '{print $4}')"
-  echo -e "  OUTPUT: $(iptables -L OUTPUT | head -n1 | awk '{print $4}')"
-  echo -e "  FORWARD: $(iptables -L FORWARD | head -n1 | awk '{print $4}')"
-  
-  echo -e "\n${YELLOW}Select chain to modify:${NC}"
-  echo "1) INPUT"
-  echo "2) OUTPUT"
-  echo "3) FORWARD"
-  echo "4) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-4):${NC} "
-  read -r chain_choice
-  
-  case $chain_choice in
-    1) chain="INPUT" ;;
-    2) chain="OUTPUT" ;;
-    3) chain="FORWARD" ;;
     4) return ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  echo -e "\n${YELLOW}Select policy for $chain chain:${NC}"
-  echo "1) ACCEPT (allow all traffic by default)"
-  echo "2) DROP (silently discard traffic by default)"
-  echo "3) REJECT (discard and send error message by default)"
-  echo -e "${BLUE}Enter your choice (1-3):${NC} "
-  read -r policy_choice
-  
-  case $policy_choice in
-    1) policy="ACCEPT" ;;
-    2) policy="DROP" ;;
-    3) policy="REJECT" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
-  esac
-  
-  # Warning for potentially dangerous settings
-  if [ "$chain" = "INPUT" ] && [ "$policy" = "DROP" ]; then
-    echo -e "${RED}WARNING: Setting INPUT policy to DROP will block all incoming connections${NC}"
-    echo -e "${RED}that are not explicitly allowed. This may lock you out of SSH.${NC}"
-    echo -e "${YELLOW}Do you have rules to allow necessary services? (y/n):${NC} "
-    read -r has_rules
-    
-    if ! [[ "$has_rules" =~ ^[Yy]$ ]]; then
-      echo -e "${YELLOW}Would you like to add a rule to allow SSH first? (y/n):${NC} "
-      read -r add_ssh
-      
-      if [[ "$add_ssh" =~ ^[Yy]$ ]]; then
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        echo -e "${GREEN}Rule added to allow SSH.${NC}"
-      fi
-    fi
-  fi
-  
-  echo -e "${RED}Warning: Changing default policy to $policy for $chain chain.${NC}"
-  echo -e "${BLUE}Confirm? (y/n):${NC} "
-  read -r confirm
-  
-  if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    iptables -P $chain $policy
-    
-    if [ $? -eq 0 ]; then
-      echo -e "${GREEN}Default policy changed successfully!${NC}"
-      log_action "Changed default policy for $chain to $policy"
-      
-      # Save changes
-      if command -v iptables-save > /dev/null; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-      fi
-    else
-      echo -e "${RED}Failed to change default policy.${NC}"
-    fi
-  else
-    echo -e "${YELLOW}Operation cancelled.${NC}"
-  fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Function for audit and monitoring
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DEFAULT POLICIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set_default_policies() {
+  show_section "Default Policies"
+
+  local pol_in pol_out pol_fwd
+  pol_in=$(iptables  -L INPUT   2>/dev/null | head -n1 | awk '{print $4}')
+  pol_out=$(iptables -L OUTPUT  2>/dev/null | head -n1 | awk '{print $4}')
+  pol_fwd=$(iptables -L FORWARD 2>/dev/null | head -n1 | awk '{print $4}')
+
+  echo -e "\n  ${C_SUBTITLE}Current default policies:${RESET}"
+  echo -e "  ${C_BORDER}$(repeat_char '─' 40)${RESET}"
+  echo -e "  ${C_LABEL}INPUT  ${RESET}  ${C_TEXT}${pol_in:-?}${RESET}"
+  echo -e "  ${C_LABEL}OUTPUT ${RESET}  ${C_TEXT}${pol_out:-?}${RESET}"
+  echo -e "  ${C_LABEL}FORWARD${RESET}  ${C_TEXT}${pol_fwd:-?}${RESET}"
+  echo -e "  ${C_BORDER}$(repeat_char '─' 40)${RESET}"
+
+  choice_box "Select chain to modify" \
+    "1:INPUT" "2:OUTPUT" "3:FORWARD" "4:Back"
+  read -r chain_choice
+  case $chain_choice in
+    1) chain="INPUT" ;; 2) chain="OUTPUT" ;; 3) chain="FORWARD" ;;
+    4) return ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
+  esac
+
+  choice_box "New policy for ${chain}" \
+    "1:ACCEPT  — allow all by default" \
+    "2:DROP    — silently discard by default" \
+    "3:REJECT  — discard + error by default"
+  read -r policy_choice
+  case $policy_choice in
+    1) policy="ACCEPT" ;; 2) policy="DROP" ;; 3) policy="REJECT" ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
+  esac
+
+  if [ "$chain" = "INPUT" ] && [ "$policy" = "DROP" ]; then
+    echo -e "\n  ${C_ERROR}${BOLD}  ⚠  LOCKOUT RISK${RESET}"
+    echo -e "  ${C_ERROR}  Setting INPUT to DROP without an SSH rule will lock you out.${RESET}"
+    ask_confirm "Do you have an ACCEPT rule for SSH?" || {
+      ask_confirm "Add an SSH ACCEPT rule now?" && {
+        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+        msg_ok "SSH rule added."
+      }
+    }
+  fi
+
+  msg_warn "Changing ${chain} default policy to ${policy}."
+  ask_confirm "Confirm?" || { msg_warn "Cancelled."; press_enter; return; }
+
+  iptables -P "$chain" "$policy"
+  if [ $? -eq 0 ]; then
+    msg_ok "Policy for ${chain} set to ${policy}."
+    log_action "Changed default policy: $chain → $policy"
+    command -v iptables-save > /dev/null && \
+      { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
+  else
+    msg_err "Failed to change policy."
+  fi
+
+  press_enter
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUDIT & MONITORING
+# ═══════════════════════════════════════════════════════════════════════════════
+
 audit_and_monitor() {
-  show_header
-  echo -e "${CYAN}╔═══ AUDIT & MONITORING ═══╗${NC}"
-  
-  echo -e "${YELLOW}Select option:${NC}"
-  echo "1) View rules with packet counters"
-  echo "2) View recently used rules"
-  echo "3) Filter rules by protocol"
-  echo "4) Filter rules by port"
-  echo "5) Export audit report"
-  echo "6) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-6):${NC} "
+  show_section "Audit & Monitoring"
+
+  choice_box "Select operation" \
+    "1:View rules with packet counters" \
+    "2:View active rules  (non-zero hits)" \
+    "3:Filter by protocol" \
+    "4:Filter by port" \
+    "5:Export audit report" \
+    "6:Back to main menu"
   read -r audit_choice
-  
+
+  _print_chain() {
+    local c="$1" filter="${2:-}"
+    echo -e "\n  ${C_TITLE}${BOLD}── ${c} ──────────────────────────────────${RESET}"
+    if [ -n "$filter" ]; then
+      iptables -L "$c" -v -n 2>/dev/null | grep -i "$filter" | while IFS= read -r line; do
+        echo -e "  ${C_TEXT}${line}${RESET}"
+      done
+    else
+      iptables -L "$c" -v -n 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+        echo -e "  ${C_TEXT}${line}${RESET}"
+      done
+    fi
+  }
+
   case $audit_choice in
     1)
-      # View rules with packet counters
-      echo -e "\n${YELLOW}Rules with packet counters:${NC}"
-      echo -e "${BLUE}INPUT chain:${NC}"
-      iptables -L INPUT -v -n
-      echo -e "\n${BLUE}OUTPUT chain:${NC}"
-      iptables -L OUTPUT -v -n
-      echo -e "\n${BLUE}FORWARD chain:${NC}"
-      iptables -L FORWARD -v -n
+      for c in INPUT OUTPUT FORWARD; do _print_chain "$c"; done
       ;;
-      
     2)
-      # View recently used rules (rules with non-zero packet count)
-      echo -e "\n${YELLOW}Recently used rules:${NC}"
-      echo -e "${BLUE}INPUT chain:${NC}"
-      iptables -L INPUT -v -n | grep -v "0     0" | grep -v "Chain INPUT"
-      echo -e "\n${BLUE}OUTPUT chain:${NC}"
-      iptables -L OUTPUT -v -n | grep -v "0     0" | grep -v "Chain OUTPUT"
-      echo -e "\n${BLUE}FORWARD chain:${NC}"
-      iptables -L FORWARD -v -n | grep -v "0     0" | grep -v "Chain FORWARD"
+      msg_info "Showing only rules with recorded hits:"
+      for c in INPUT OUTPUT FORWARD; do
+        echo -e "\n  ${C_TITLE}${BOLD}── ${c} ──────────────────────────────────${RESET}"
+        iptables -L "$c" -v -n 2>/dev/null | grep -v "0     0" | grep -v "^Chain" | while IFS= read -r line; do
+          echo -e "  ${C_TEXT}${line}${RESET}"
+        done
+      done
       ;;
-      
     3)
-      # Filter rules by protocol
-      echo -e "\n${YELLOW}Select protocol:${NC}"
-      echo "1) TCP"
-      echo "2) UDP"
-      echo "3) ICMP"
-      echo -e "${BLUE}Enter your choice (1-3):${NC} "
+      choice_box "Select protocol" "1:TCP" "2:UDP" "3:ICMP"
       read -r proto_choice
-      
       case $proto_choice in
-        1) proto="tcp" ;;
-        2) proto="udp" ;;
-        3) proto="icmp" ;;
-        *) 
-          echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-          sleep 2
-          return
-          ;;
+        1) proto="tcp" ;; 2) proto="udp" ;; 3) proto="icmp" ;;
+        *) msg_err "Invalid choice."; press_enter; return ;;
       esac
-      
-      echo -e "\n${YELLOW}Rules for $proto protocol:${NC}"
-      echo -e "${BLUE}INPUT chain:${NC}"
-      iptables -L INPUT -v -n | grep -i $proto
-      echo -e "\n${BLUE}OUTPUT chain:${NC}"
-      iptables -L OUTPUT -v -n | grep -i $proto
-      echo -e "\n${BLUE}FORWARD chain:${NC}"
-      iptables -L FORWARD -v -n | grep -i $proto
+      for c in INPUT OUTPUT FORWARD; do _print_chain "$c" "$proto"; done
       ;;
-      
     4)
-      # Filter rules by port
-      echo -e "\n${YELLOW}Enter port number:${NC} "
+      ask "Port number"
       read -r port
-      
       if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid port number.${NC}"
-        echo -e "\n${BLUE}Press Enter to continue...${NC}"
-        read
-        return
+        msg_err "Invalid port."; press_enter; return
       fi
-      
-      echo -e "\n${YELLOW}Rules for port $port:${NC}"
-      echo -e "${BLUE}INPUT chain:${NC}"
-      iptables -L INPUT -v -n | grep -i "dpt:$port"
-      echo -e "\n${BLUE}OUTPUT chain:${NC}"
-      iptables -L OUTPUT -v -n | grep -i "dpt:$port"
-      echo -e "\n${BLUE}FORWARD chain:${NC}"
-      iptables -L FORWARD -v -n | grep -i "dpt:$port"
+      for c in INPUT OUTPUT FORWARD; do _print_chain "$c" "dpt:$port"; done
       ;;
-      
     5)
-      # Export audit report
-      local timestamp=$(date +%Y%m%d%H%M%S)
-      local report_file="/tmp/iptables_audit_$timestamp.txt"
-      
-      echo "IPTABLES AUDIT REPORT - $(date)" > "$report_file"
-      echo "=======================================" >> "$report_file"
-      
-      echo -e "\nDEFAULT POLICIES:" >> "$report_file"
-      echo "INPUT: $(iptables -L INPUT | head -n1 | awk '{print $4}')" >> "$report_file"
-      echo "OUTPUT: $(iptables -L OUTPUT | head -n1 | awk '{print $4}')" >> "$report_file"
-      echo "FORWARD: $(iptables -L FORWARD | head -n1 | awk '{print $4}')" >> "$report_file"
-      
-      echo -e "\nINPUT CHAIN RULES:" >> "$report_file"
-      iptables -L INPUT -v -n >> "$report_file"
-      
-      echo -e "\nOUTPUT CHAIN RULES:" >> "$report_file"
-      iptables -L OUTPUT -v -n >> "$report_file"
-      
-      echo -e "\nFORWARD CHAIN RULES:" >> "$report_file"
-      iptables -L FORWARD -v -n >> "$report_file"
-      
-      echo -e "\nACTIVE CONNECTIONS:" >> "$report_file"
-      netstat -tuln >> "$report_file" 2>/dev/null || ss -tuln >> "$report_file"
-      
-      echo -e "\nRECENT FIREWALL LOGS:" >> "$report_file"
-      tail -n 50 "$LOG_FILE" >> "$report_file" 2>/dev/null
-      
-      echo -e "${GREEN}Audit report exported to $report_file${NC}"
-      log_action "Exported audit report to $report_file"
+      local ts; ts=$(date +%Y%m%d%H%M%S)
+      local rpt="/tmp/fire-ux_audit_${ts}.txt"
+      {
+        echo "═══════════════════════════════════════════════"
+        echo "  FIRE-UX  ·  Audit Report  ·  $(date)"
+        echo "═══════════════════════════════════════════════"
+        echo ""
+        echo "DEFAULT POLICIES"
+        echo "  INPUT:   $(iptables -L INPUT   2>/dev/null | head -n1 | awk '{print $4}')"
+        echo "  OUTPUT:  $(iptables -L OUTPUT  2>/dev/null | head -n1 | awk '{print $4}')"
+        echo "  FORWARD: $(iptables -L FORWARD 2>/dev/null | head -n1 | awk '{print $4}')"
+        echo ""
+        echo "INPUT CHAIN"; iptables -L INPUT   -v -n 2>/dev/null
+        echo "OUTPUT CHAIN"; iptables -L OUTPUT  -v -n 2>/dev/null
+        echo "FORWARD CHAIN"; iptables -L FORWARD -v -n 2>/dev/null
+        echo ""
+        echo "ACTIVE CONNECTIONS"
+        netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null
+        echo ""
+        echo "RECENT LOG (last 50 entries)"
+        tail -n 50 "$LOG_FILE" 2>/dev/null
+      } > "$rpt"
+      msg_ok "Audit report exported to: ${rpt}"
+      log_action "Exported audit report to $rpt"
       ;;
-      
-    6)
-      # Back to main menu
-      return
-      ;;
-      
-    *)
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    6) return ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Function for preconfigured rules
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PRECONFIGURED RULES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 preconfigured_rules() {
-  show_header
-  echo -e "${CYAN}╔═══ PRECONFIGURED RULES ═══╗${NC}"
-  
-  echo -e "${YELLOW}Select a preset:${NC}"
-  echo "1) Basic server (SSH only)"
-  echo "2) Web server (HTTP/HTTPS)"
-  echo "3) Mail server (SMTP/POP3/IMAP)"
-  echo "4) FTP server"
-  echo "5) VPN server (WireGuard)"
-  echo "6) Database server"
-  echo "7) ERPNext server (port 8080)"
-  echo "8) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-8):${NC} "
+  show_section "Preconfigured Rules"
+
+  choice_box "Select preset" \
+    "1:Basic Server     — SSH only" \
+    "2:Web Server       — HTTP + HTTPS + SSH" \
+    "3:Mail Server      — SMTP/POP3/IMAP + SSH" \
+    "4:FTP Server       — FTP passive + SSH" \
+    "5:VPN Server       — WireGuard + NAT + SSH" \
+    "6:Database Server  — MySQL/PG/Mongo/Redis + SSH" \
+    "7:ERPNext Server   — port 8080 via WireGuard" \
+    "8:Back to main menu"
   read -r preset_choice
-  
-  # Backup current rules before applying preset
-  local timestamp=$(date +%Y%m%d%H%M%S)
-  local backup_file="$PROFILES_DIR/backup_before_preset_$timestamp"
-  iptables-save > "$backup_file"
-  
+
+  [ "$preset_choice" = "8" ] && return
+  [[ ! "$preset_choice" =~ ^[1-7]$ ]] && { msg_err "Invalid choice."; sleep 2; return; }
+
+  local ts; ts=$(date +%Y%m%d%H%M%S)
+  local bk="$PROFILES_DIR/backup_before_preset_$ts"
+  iptables-save > "$bk"
+
+  msg_warn "This will replace all current rules. Backup: ${bk}"
+  ask_confirm "Apply preset?" || { msg_warn "Cancelled."; press_enter; return; }
+
+  # Common base setup
+  _apply_base() {
+    iptables -F; iptables -X
+    iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+  }
+
+  _save_rules() {
+    command -v iptables-save > /dev/null && \
+      { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
+  }
+
   case $preset_choice in
     1)
-      # Basic server (SSH only)
-      echo -e "${YELLOW}Applying basic server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        # Allow ping
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        
-        echo -e "${GREEN}Basic server preset applied successfully!${NC}"
-        log_action "Applied basic server preset"
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      _apply_base
+      msg_ok "Basic server preset applied  (SSH + ICMP)."
+      log_action "Applied preset: basic server"
       ;;
-      
     2)
-      # Web server (HTTP/HTTPS)
-      echo -e "${YELLOW}Applying web server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        # Allow HTTP
-        iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-        
-        # Allow HTTPS
-        iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-        
-        # Allow ping
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        
-        echo -e "${GREEN}Web server preset applied successfully!${NC}"
-        log_action "Applied web server preset"
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      _apply_base
+      iptables -A INPUT -p tcp --dport 80  -j ACCEPT
+      iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+      msg_ok "Web server preset applied  (SSH, HTTP, HTTPS, ICMP)."
+      log_action "Applied preset: web server"
       ;;
-      
     3)
-      # Mail server (SMTP/POP3/IMAP)
-      echo -e "${YELLOW}Applying mail server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        # Allow SMTP
-        iptables -A INPUT -p tcp --dport 25 -j ACCEPT
-        
-        # Allow SMTPS
-        iptables -A INPUT -p tcp --dport 465 -j ACCEPT
-        
-        # Allow Submission
-        iptables -A INPUT -p tcp --dport 587 -j ACCEPT
-        
-        # Allow POP3
-        iptables -A INPUT -p tcp --dport 110 -j ACCEPT
-        
-        # Allow POP3S
-        iptables -A INPUT -p tcp --dport 995 -j ACCEPT
-        
-        # Allow IMAP
-        iptables -A INPUT -p tcp --dport 143 -j ACCEPT
-        
-        # Allow IMAPS
-        iptables -A INPUT -p tcp --dport 993 -j ACCEPT
-        
-        # Allow ping
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        
-        echo -e "${GREEN}Mail server preset applied successfully!${NC}"
-        log_action "Applied mail server preset"
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      _apply_base
+      for p in 25 465 587 110 995 143 993; do
+        iptables -A INPUT -p tcp --dport $p -j ACCEPT
+      done
+      msg_ok "Mail server preset applied  (SSH, SMTP/S, POP3/S, IMAP/S, ICMP)."
+      log_action "Applied preset: mail server"
       ;;
-      
     4)
-      # FTP server
-      echo -e "${YELLOW}Applying FTP server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        # Allow FTP control
-        iptables -A INPUT -p tcp --dport 21 -j ACCEPT
-        
-        # Allow FTP data (passive mode)
-        iptables -A INPUT -p tcp --dport 1024:1048 -j ACCEPT
-        
-        # Load FTP connection tracking module
-        modprobe nf_conntrack_ftp || modprobe ip_conntrack_ftp 2>/dev/null
-        
-        # Allow ping
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        
-        echo -e "${GREEN}FTP server preset applied successfully!${NC}"
-        log_action "Applied FTP server preset"
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      _apply_base
+      iptables -A INPUT -p tcp --dport 21         -j ACCEPT
+      iptables -A INPUT -p tcp --dport 1024:1048  -j ACCEPT
+      modprobe nf_conntrack_ftp 2>/dev/null || modprobe ip_conntrack_ftp 2>/dev/null
+      msg_ok "FTP server preset applied  (SSH, FTP control+passive, ICMP)."
+      log_action "Applied preset: FTP server"
       ;;
-      
     5)
-      # VPN server (WireGuard)
-      echo -e "${YELLOW}Applying WireGuard VPN server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        # Allow WireGuard
-        iptables -A INPUT -p udp --dport 51820 -j ACCEPT
-        
-        # Allow forwarding for WireGuard
-        iptables -A FORWARD -i wg0 -j ACCEPT
-        iptables -A FORWARD -o wg0 -j ACCEPT
-        
-        # Enable NAT for VPN clients
-        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-        
-        # Allow ping
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        
-        # Enable IP forwarding
-        echo 1 > /proc/sys/net/ipv4/ip_forward
-        
-        echo -e "${GREEN}WireGuard VPN server preset applied successfully!${NC}"
-        log_action "Applied WireGuard VPN server preset"
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-        
-        # Make IP forwarding persistent
-        if [ -f /etc/sysctl.conf ]; then
-          if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-          fi
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      _apply_base
+      iptables -A INPUT   -p udp --dport 51820       -j ACCEPT
+      iptables -A FORWARD -i wg0 -j ACCEPT
+      iptables -A FORWARD -o wg0 -j ACCEPT
+      iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+      echo 1 > /proc/sys/net/ipv4/ip_forward
+      grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || \
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+      msg_ok "WireGuard VPN preset applied  (SSH, WG 51820, NAT, IP forwarding)."
+      log_action "Applied preset: WireGuard VPN"
       ;;
-      
     6)
-      # Database server
-      echo -e "${YELLOW}Applying database server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-        
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-        
-        # Allow loopback
-        iptables -A INPUT -i lo -j ACCEPT
-        
-        # Allow established connections
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow SSH
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        
-        # Allow MySQL/MariaDB
-        iptables -A INPUT -p tcp --dport 3306 -j ACCEPT
-        
-        # Allow PostgreSQL
-        iptables -A INPUT -p tcp --dport 5432 -j ACCEPT
-        
-        # Allow MongoDB
-        iptables -A INPUT -p tcp --dport 27017 -j ACCEPT
-        
-        # Allow Redis
-        iptables -A INPUT -p tcp --dport 6379 -j ACCEPT
-        
-        # Allow ping
-        iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
-        
-        echo -e "${GREEN}Database server preset applied successfully!${NC}"
-        log_action "Applied database server preset"
-        
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
+      _apply_base
+      for p in 3306 5432 27017 6379; do
+        iptables -A INPUT -p tcp --dport $p -j ACCEPT
+      done
+      msg_ok "Database preset applied  (SSH, MySQL, PG, MongoDB, Redis, ICMP)."
+      log_action "Applied preset: database server"
       ;;
-
     7)
-      # ERPNext server (port 8080)
-      echo -e "${YELLOW}Applying ERPNext server preset...${NC}"
-      
-      # Confirm
-      echo -e "${RED}Warning: This will replace all current rules.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Clear existing rules
-        iptables -F
-        iptables -X
-
-        # Set default policies
-        iptables -P INPUT DROP
-        iptables -P FORWARD DROP
-        iptables -P OUTPUT ACCEPT
-
-        # Allow loopback and established connections
-        iptables -A INPUT -i lo -j ACCEPT
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-        # Allow SSH (optional)
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-
-        # Allow ERPNext web interface (port 8080)
-        iptables -A INPUT -p tcp --dport 8080 -i wg0 -s 10.0.0.0/24 -j ACCEPT
-
-        echo -e "${GREEN}ERPNext preset applied successfully!${NC}"
-        log_action "Applied ERPNext server preset"
-
-        # Save changes
-        if command -v iptables-save > /dev/null; then
-          iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
-      ;;
-
-    8)
-      # Back to main menu
-      return
-      ;;
-      
-    *)
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
+      iptables -F; iptables -X
+      iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
+      iptables -A INPUT -i lo -j ACCEPT
+      iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+      iptables -A INPUT -p tcp --dport 8080 -i wg0 -s 10.0.0.0/24 -j ACCEPT
+      msg_ok "ERPNext preset applied  (SSH + port 8080 via wg0/10.0.0.0/24)."
+      log_action "Applied preset: ERPNext"
       ;;
   esac
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  _save_rules
+  press_enter
 }
 
-# Function for test mode
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TEST MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 test_mode() {
-  show_header
-  echo -e "${CYAN}╔═══ TEST MODE ═══╗${NC}"
-  
-  echo -e "${YELLOW}This mode allows you to test a rule temporarily.${NC}"
-  echo -e "${YELLOW}The rule will be automatically removed after the specified time.${NC}"
-  
-  # Backup current rules
-  local timestamp=$(date +%Y%m%d%H%M%S)
-  local backup_file="$PROFILES_DIR/backup_before_test_$timestamp"
-  iptables-save > "$backup_file"
-  
-  # Choose chain
-  echo -e "\n${YELLOW}Select chain:${NC}"
-  echo "1) INPUT (incoming traffic)"
-  echo "2) OUTPUT (outgoing traffic)"
-  echo "3) FORWARD (traffic being routed)"
-  echo -e "${BLUE}Enter your choice (1-3):${NC} "
+  show_section "Test Mode"
+
+  echo -e "  ${C_SUBTITLE}Apply a rule temporarily. It will be auto-removed when the timer ends.${RESET}"
+  echo -e "  ${C_MUTED}Press ${C_KEY}Ctrl+C${C_MUTED} at any time to cancel and restore immediately.${RESET}"
+
+  local ts; ts=$(date +%Y%m%d%H%M%S)
+  local bk="$PROFILES_DIR/backup_before_test_$ts"
+  iptables-save > "$bk"
+
+  # Chain
+  choice_box "Select chain" \
+    "1:INPUT  — Incoming traffic" \
+    "2:OUTPUT — Outgoing traffic" \
+    "3:FORWARD — Routed traffic"
   read -r chain_choice
-  
   case $chain_choice in
-    1) chain="INPUT" ;;
-    2) chain="OUTPUT" ;;
-    3) chain="FORWARD" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    1) chain="INPUT" ;; 2) chain="OUTPUT" ;; 3) chain="FORWARD" ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  # Choose protocol
-  echo -e "\n${YELLOW}Select protocol:${NC}"
-  echo "1) TCP"
-  echo "2) UDP"
-  echo "3) Both (TCP and UDP)"
-  echo "4) ICMP (ping)"
-  echo "5) All protocols"
-  echo -e "${BLUE}Enter your choice (1-5):${NC} "
+
+  # Protocol
+  choice_box "Select protocol" \
+    "1:TCP" "2:UDP" "3:Both" "4:ICMP" "5:All"
   read -r protocol_choice
-  
   case $protocol_choice in
-    1) protocol="tcp" ;;
-    2) protocol="udp" ;;
-    3) protocol="all" ;;
-    4) protocol="icmp" ;;
-    5) protocol="all" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    1) protocol="tcp" ;; 2) protocol="udp" ;;
+    3) protocol="all" ;; 4) protocol="icmp" ;; 5) protocol="all" ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  # Port (if TCP or UDP)
+
+  # Port
   port=""
   if [ "$protocol" = "tcp" ] || [ "$protocol" = "udp" ]; then
-    echo -e "\n${YELLOW}Enter port number or service name:${NC}"
-    echo "Examples: 22 (SSH), 80 (HTTP), 443 (HTTPS), etc."
-    echo -e "${BLUE}Port/Service:${NC} "
+    ask "Port or service  (e.g. 22, 80, 443)"
     read -r port
-    
     if ! [[ "$port" =~ ^[0-9]+$ ]] && ! grep -q "^$port" /etc/services; then
-      echo -e "${RED}Invalid port or service. Returning to main menu.${NC}"
-      sleep 2
-      return
+      msg_err "Invalid port."; sleep 2; return
     fi
   fi
-  
-  # Source IP address
-  echo -e "\n${YELLOW}Enter source IP address:${NC}"
-  echo "Examples: 192.168.1.10, 10.0.0.0/8, or leave empty for any"
-  echo -e "${BLUE}Source IP:${NC} "
+
+  # Source IP
+  ask "Source IP  (empty = any)"
   read -r source_ip
-  
-  # If empty, use any
-  if [ -z "$source_ip" ]; then
-    source_ip="0.0.0.0/0"
-  fi
-  
+  [ -z "$source_ip" ] && source_ip="0.0.0.0/0"
+
   # Action
-  echo -e "\n${YELLOW}Select action:${NC}"
-  echo "1) ACCEPT (allow traffic)"
-  echo "2) DROP (silently discard traffic)"
-  echo "3) REJECT (discard and send error message)"
-  echo -e "${BLUE}Enter your choice (1-3):${NC} "
+  choice_box "Select action" \
+    "1:ACCEPT" "2:DROP" "3:REJECT"
   read -r action_choice
-  
   case $action_choice in
-    1) action="ACCEPT" ;;
-    2) action="DROP" ;;
-    3) action="REJECT" ;;
-    *) 
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    1) action="ACCEPT" ;; 2) action="DROP" ;; 3) action="REJECT" ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
-  
-  # Test duration
-  echo -e "\n${YELLOW}Enter test duration in minutes:${NC} "
+
+  # Duration
+  ask "Test duration in minutes"
   read -r duration
-  
   if ! [[ "$duration" =~ ^[0-9]+$ ]] || [ "$duration" -eq 0 ]; then
-    echo -e "${RED}Invalid duration. Returning to main menu.${NC}"
-    sleep 2
-    return
+    msg_err "Invalid duration."; sleep 2; return
   fi
-  
-  # Build the iptables command
+
+  # Build command
   cmd="iptables -A $chain"
-  
-  if [ "$protocol" != "all" ]; then
-    cmd="$cmd -p $protocol"
-  fi
-  
-  if [ -n "$port" ] && [ "$protocol" != "icmp" ]; then
-    cmd="$cmd --dport $port"
-  fi
-  
-  if [ "$source_ip" != "0.0.0.0/0" ]; then
-    cmd="$cmd -s $source_ip"
-  fi
-  
+  [ "$protocol" != "all" ] && cmd="$cmd -p $protocol"
+  [ -n "$port" ] && [ "$protocol" != "icmp" ] && cmd="$cmd --dport $port"
+  [ "$source_ip" != "0.0.0.0/0" ] && cmd="$cmd -s $source_ip"
   cmd="$cmd -j $action"
-  
-  # Confirm rule
-  echo -e "\n${YELLOW}Rule to be tested:${NC}"
-  echo -e "${GREEN}$cmd${NC}"
-  echo -e "\n${YELLOW}Test duration: $duration minutes${NC}"
-  echo -e "\n${BLUE}Confirm? (y/n):${NC} "
-  read -r confirm
-  
-  if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    # Execute the command
-    eval "$cmd"
-    
-    if [ $? -eq 0 ]; then
-      echo -e "${GREEN}Test rule applied successfully!${NC}"
-      log_action "Started test mode with rule: $cmd (duration: $duration minutes)"
-      
-      # Start countdown
-      echo -e "\n${YELLOW}Test in progress. Rule will be removed in $duration minutes.${NC}"
-      echo -e "${YELLOW}Press Ctrl+C to cancel and restore previous rules.${NC}"
-      
-      # Create a trap to handle Ctrl+C
-      trap 'echo -e "${YELLOW}Test cancelled. Restoring previous rules...${NC}"; iptables-restore < "$backup_file"; log_action "Test mode cancelled manually"; echo -e "${GREEN}Previous rules restored.${NC}"; exit 0' INT
-      
-      # Countdown
-      for ((i=duration*60; i>=0; i--)); do
-        mins=$((i/60))
-        secs=$((i%60))
-        printf "\r${BLUE}Time remaining: %02d:%02d${NC}" $mins $secs
-        sleep 1
-      done
-      
-      # Restore previous rules
-      echo -e "\n\n${YELLOW}Test completed. Restoring previous rules...${NC}"
-      iptables-restore < "$backup_file"
-      
-      if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Previous rules restored successfully!${NC}"
-        log_action "Test mode completed after $duration minutes"
-      else
-        echo -e "${RED}Failed to restore previous rules.${NC}"
-        echo -e "${YELLOW}Manual intervention may be required.${NC}"
-      fi
-    else
-      echo -e "${RED}Failed to apply test rule.${NC}"
-    fi
-  else
-    echo -e "${YELLOW}Operation cancelled.${NC}"
+
+  echo -e "\n  ${C_BORDER_LT}$(repeat_char '─' 54)${RESET}"
+  echo -e "  ${C_SUBTITLE}Test rule:${RESET}  ${C_HIGHLIGHT}${cmd}${RESET}"
+  echo -e "  ${C_SUBTITLE}Duration: ${RESET}  ${C_WARN}${duration} min${RESET}"
+  echo -e "  ${C_BORDER_LT}$(repeat_char '─' 54)${RESET}"
+
+  ask_confirm "Start test?" || { msg_warn "Cancelled."; press_enter; return; }
+
+  eval "$cmd"
+  if [ $? -ne 0 ]; then
+    msg_err "Failed to apply test rule."; press_enter; return
   fi
-  
-  # Reset the trap
+
+  msg_ok "Test rule active. Counting down..."
+  log_action "Test mode started: $cmd (${duration}m)"
+
+  trap 'echo -e "\n\n  ${C_WARN}${BOLD}⚠${RESET}  ${C_TEXT}Test cancelled — restoring rules...${RESET}"; iptables-restore < "$bk"; log_action "Test mode cancelled manually"; echo -e "  ${C_SUCCESS}✓  Rules restored.${RESET}"; exit 0' INT
+
+  echo ""
+  for ((i=duration*60; i>=0; i--)); do
+    local mins=$((i/60)) secs=$((i%60))
+    local bar_total=40
+    local bar_done=$(( (duration*60 - i) * bar_total / (duration*60) ))
+    local bar_left=$(( bar_total - bar_done ))
+    local bar
+    bar="${C_SUCCESS}$(repeat_char '█' $bar_done)${C_MUTED}$(repeat_char '░' $bar_left)${RESET}"
+    printf "\r  ${bar}  ${C_NUM}%02d:%02d${RESET} remaining " "$mins" "$secs"
+    sleep 1
+  done
+
   trap - INT
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  echo -e "\n"
+  msg_info "Timer expired. Restoring previous rules..."
+  iptables-restore < "$bk"
+  [ $? -eq 0 ] && { msg_ok "Rules restored."; log_action "Test mode completed after ${duration}m"; } \
+               || { msg_err "Restore failed — manual intervention may be required."; }
+
+  press_enter
 }
 
-# Function to manage network routing
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NETWORK ROUTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
 manage_network_routing() {
-  show_header
-  echo -e "${CYAN}╔═══ NETWORK ROUTING MANAGEMENT ═══╗${NC}"
-  
-  echo -e "${YELLOW}Select option:${NC}"
-  echo "1) Create new network route"
-  echo "2) View existing routes"
-  echo "3) Delete a route"
-  echo "4) Enable/Disable IP forwarding"
-  echo "5) Back to main menu"
-  echo -e "${BLUE}Enter your choice (1-5):${NC} "
+  show_section "Network Routing"
+
+  choice_box "Select operation" \
+    "1:Create new route" \
+    "2:View existing routes" \
+    "3:Delete a route" \
+    "4:Enable / Disable IP forwarding" \
+    "5:Back to main menu"
   read -r route_choice
-  
+
   case $route_choice in
-    1)
-      # Create new network route
-      create_network_route
-      ;;
-      
-    2)
-      # View existing routes
-      view_network_routes
-      ;;
-      
-    3)
-      # Delete a route
-      delete_network_route
-      ;;
-      
-    4)
-      # Enable/Disable IP forwarding
-      toggle_ip_forwarding
-      ;;
-      
-    5)
-      # Back to main menu
-      return
-      ;;
-      
-    *)
-      echo -e "${RED}Invalid choice. Returning to main menu.${NC}"
-      sleep 2
-      return
-      ;;
+    1) create_network_route ;;
+    2) view_network_routes ;;
+    3) delete_network_route ;;
+    4) toggle_ip_forwarding ;;
+    5) return ;;
+    *) msg_err "Invalid choice."; sleep 2; return ;;
   esac
 }
 
-# Function to create a new network route
+# ─── Create route ─────────────────────────────────────────────────────────────
+
 create_network_route() {
-  show_header
-  echo -e "${CYAN}╔═══ CREATE NETWORK ROUTE ═══╗${NC}"
-  
-  # Get route name
-  echo -e "${YELLOW}Enter a name for this route:${NC} "
+  show_section "Network Routing  ›  Create Route"
+
+  ask "Route name"
   read -r route_name
-  
-  if [ -z "$route_name" ]; then
-    echo -e "${RED}Route name cannot be empty.${NC}"
-    echo -e "\n${BLUE}Press Enter to continue...${NC}"
-    read
-    return
-  fi
-  
-  # Sanitize route name
+  [ -z "$route_name" ] && { msg_err "Name cannot be empty."; press_enter; return; }
   route_name=$(echo "$route_name" | tr -cd '[:alnum:]._-')
-  route_file="$ROUTES_DIR/$route_name"
-  
-  # Check if route already exists
-  if [ -f "$route_file" ]; then
-    echo -e "${YELLOW}Route already exists. Overwrite? (y/n):${NC} "
-    read -r overwrite
-    
-    if ! [[ "$overwrite" =~ ^[Yy]$ ]]; then
-      echo -e "${YELLOW}Operation cancelled.${NC}"
-      echo -e "\n${BLUE}Press Enter to continue...${NC}"
-      read
-      return
-    fi
+  local rf="$ROUTES_DIR/$route_name"
+
+  if [ -f "$rf" ]; then
+    ask_confirm "Route already exists. Overwrite?" || { msg_warn "Cancelled."; press_enter; return; }
   fi
-  
-  # Source interface
-  echo -e "\n${YELLOW}Enter source interface (e.g., wg0):${NC} "
+
+  ask "Source interface  (e.g. wg0)"
   read -r source_interface
-  
-  if [ -z "$source_interface" ]; then
-    echo -e "${RED}Source interface cannot be empty.${NC}"
-    echo -e "\n${BLUE}Press Enter to continue...${NC}"
-    read
-    return
-  fi
-  
-  # Source network
-  echo -e "\n${YELLOW}Enter source network (e.g., 10.0.0.0/24):${NC} "
+  [ -z "$source_interface" ] && { msg_err "Cannot be empty."; press_enter; return; }
+
+  ask "Source network  (e.g. 10.0.0.0/24)"
   read -r source_network
-  
-  if [ -z "$source_network" ]; then
-    echo -e "${RED}Source network cannot be empty.${NC}"
-    echo -e "\n${BLUE}Press Enter to continue...${NC}"
-    read
-    return
-  fi
-  
-  # Destination interface
-  echo -e "\n${YELLOW}Enter destination interface (e.g., eth0):${NC} "
+  [ -z "$source_network" ] && { msg_err "Cannot be empty."; press_enter; return; }
+
+  ask "Destination interface  (e.g. eth0)"
   read -r dest_interface
-  
-  if [ -z "$dest_interface" ]; then
-    echo -e "${RED}Destination interface cannot be empty.${NC}"
-    echo -e "\n${BLUE}Press Enter to continue...${NC}"
-    read
-    return
-  fi
-  
-  # Destination network
-  echo -e "\n${YELLOW}Enter destination network (e.g., 192.168.1.0/24):${NC} "
+  [ -z "$dest_interface" ] && { msg_err "Cannot be empty."; press_enter; return; }
+
+  ask "Destination network  (e.g. 192.168.1.0/24)"
   read -r dest_network
-  
-  if [ -z "$dest_network" ]; then
-    echo -e "${RED}Destination network cannot be empty.${NC}"
-    echo -e "\n${BLUE}Press Enter to continue...${NC}"
-    read
-    return
-  fi
-  
-  # Specific port to forward (optional)
-  echo -e "\n${YELLOW}Enter specific port to forward (leave empty for all traffic):${NC} "
+  [ -z "$dest_network" ] && { msg_err "Cannot be empty."; press_enter; return; }
+
+  ask "Specific port to forward  (empty = all traffic)"
   read -r forward_port
-  
-  # Protocol for port forwarding (if port specified)
-  protocol=""
+
+  local protocol=""
   if [ -n "$forward_port" ]; then
-    echo -e "\n${YELLOW}Select protocol for port forwarding:${NC}"
-    echo "1) TCP"
-    echo "2) UDP"
-    echo "3) Both (TCP and UDP)"
-    echo -e "${BLUE}Enter your choice (1-3):${NC} "
-    read -r protocol_choice
-    
-    case $protocol_choice in
-      1) protocol="tcp" ;;
-      2) protocol="udp" ;;
-      3) protocol="both" ;;
-      *) 
-        echo -e "${RED}Invalid choice. Using both TCP and UDP.${NC}"
-        protocol="both"
-        ;;
+    choice_box "Protocol for port forwarding" "1:TCP" "2:UDP" "3:Both"
+    read -r proto_choice
+    case $proto_choice in
+      1) protocol="tcp" ;; 2) protocol="udp" ;; *) protocol="both" ;;
     esac
   fi
-  
-  # Enable NAT
-  echo -e "\n${YELLOW}Enable NAT for this route? (y/n):${NC} "
-  read -r enable_nat
-  
-  # Create a temporary file with the commands
-  temp_file=$(mktemp)
-  
-  # Add commands to enable IP forwarding
-  echo "# Enable IP forwarding" > "$temp_file"
-  echo "echo 1 > /proc/sys/net/ipv4/ip_forward" >> "$temp_file"
-  
-  # Add forwarding rules
-  echo -e "\n# Allow forwarding between interfaces" >> "$temp_file"
-  echo "iptables -A FORWARD -i $source_interface -o $dest_interface -s $source_network -d $dest_network -j ACCEPT" >> "$temp_file"
-  echo "iptables -A FORWARD -i $dest_interface -o $source_interface -s $dest_network -d $source_network -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" >> "$temp_file"
-  
-  # Add specific port forwarding if specified
+
+  ask_confirm "Enable NAT for this route?" && local enable_nat="y" || local enable_nat="n"
+
+  # Build route script
+  local tmp; tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+# Enable IP forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Forward between interfaces
+iptables -A FORWARD -i $source_interface -o $dest_interface -s $source_network -d $dest_network -j ACCEPT
+iptables -A FORWARD -i $dest_interface -o $source_interface -s $dest_network -d $source_network -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+EOF
+
   if [ -n "$forward_port" ]; then
-    echo -e "\n# Port forwarding for port $forward_port" >> "$temp_file"
-    
-    if [ "$protocol" = "tcp" ] || [ "$protocol" = "both" ]; then
-      echo "iptables -A FORWARD -i $source_interface -o $dest_interface -p tcp -s $source_network -d $dest_network --dport $forward_port -j ACCEPT" >> "$temp_file"
-      echo "iptables -A FORWARD -i $dest_interface -o $source_interface -p tcp -s $dest_network -d $source_network --sport $forward_port -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" >> "$temp_file"
-    fi
-    
-    if [ "$protocol" = "udp" ] || [ "$protocol" = "both" ]; then
-      echo "iptables -A FORWARD -i $source_interface -o $dest_interface -p udp -s $source_network -d $dest_network --dport $forward_port -j ACCEPT" >> "$temp_file"
-      echo "iptables -A FORWARD -i $dest_interface -o $source_interface -p udp -s $dest_network -d $source_network --sport $forward_port -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" >> "$temp_file"
-    fi
+    [ "$protocol" = "tcp" ] || [ "$protocol" = "both" ] && cat >> "$tmp" <<EOF
+iptables -A FORWARD -i $source_interface -o $dest_interface -p tcp -s $source_network -d $dest_network --dport $forward_port -j ACCEPT
+iptables -A FORWARD -i $dest_interface -o $source_interface -p tcp -s $dest_network -d $source_network --sport $forward_port -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+EOF
+    [ "$protocol" = "udp" ] || [ "$protocol" = "both" ] && cat >> "$tmp" <<EOF
+iptables -A FORWARD -i $source_interface -o $dest_interface -p udp -s $source_network -d $dest_network --dport $forward_port -j ACCEPT
+iptables -A FORWARD -i $dest_interface -o $source_interface -p udp -s $dest_network -d $source_network --sport $forward_port -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+EOF
   fi
-  
-  # Add NAT if requested
-  if [[ "$enable_nat" =~ ^[Yy]$ ]]; then
-    echo -e "\n# Enable NAT" >> "$temp_file"
-    echo "iptables -t nat -A POSTROUTING -s $source_network -o $dest_interface -j MASQUERADE" >> "$temp_file"
-  fi
-  
-  # Add commands to make IP forwarding persistent
-  echo -e "\n# Make IP forwarding persistent" >> "$temp_file"
-  echo "if [ -f /etc/sysctl.conf ]; then" >> "$temp_file"
-  echo "  if ! grep -q \"net.ipv4.ip_forward=1\" /etc/sysctl.conf; then" >> "$temp_file"
-  echo "    echo \"net.ipv4.ip_forward=1\" >> /etc/sysctl.conf" >> "$temp_file"
-  echo "  fi" >> "$temp_file"
-  echo "fi" >> "$temp_file"
-  
-  # Save the route file
-  cp "$temp_file" "$route_file"
-  rm "$temp_file"
-  
-  # Display the route configuration
-  echo -e "\n${YELLOW}Route configuration:${NC}"
-  cat "$route_file"
-  
-  # Ask if user wants to apply the route now
-  echo -e "\n${YELLOW}Apply this route now? (y/n):${NC} "
-  read -r apply_now
-  
-  if [[ "$apply_now" =~ ^[Yy]$ ]]; then
-    # Apply the route
-    bash "$route_file"
-    
+
+  [[ "$enable_nat" =~ ^[Yy]$ ]] && echo "iptables -t nat -A POSTROUTING -s $source_network -o $dest_interface -j MASQUERADE" >> "$tmp"
+
+  cat >> "$tmp" <<'EOF'
+if [ -f /etc/sysctl.conf ]; then
+  grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+fi
+EOF
+
+  cp "$tmp" "$rf"
+  rm "$tmp"
+
+  echo -e "\n  ${C_SUBTITLE}Route configuration:${RESET}"
+  echo -e "  ${C_BORDER}$(repeat_char '─' 52)${RESET}"
+  while IFS= read -r line; do echo -e "  ${C_MUTED}${line}${RESET}"; done < "$rf"
+  echo -e "  ${C_BORDER}$(repeat_char '─' 52)${RESET}"
+
+  ask_confirm "Apply this route now?" && {
+    bash "$rf"
     if [ $? -eq 0 ]; then
-      echo -e "${GREEN}Route applied successfully!${NC}"
+      msg_ok "Route applied."
       log_action "Applied network route: $route_name"
-      
-      # Save iptables rules
-      if command -v iptables-save > /dev/null; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-      fi
+      command -v iptables-save > /dev/null && \
+        { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
     else
-      echo -e "${RED}Failed to apply route.${NC}"
+      msg_err "Failed to apply route."
     fi
-  else
-    echo -e "${YELLOW}Route saved but not applied.${NC}"
-  fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+  } || msg_info "Route saved but not applied."
+
+  press_enter
 }
 
-# Function to view existing network routes
+# ─── View routes ──────────────────────────────────────────────────────────────
+
 view_network_routes() {
-  show_header
-  echo -e "${CYAN}╔═══ VIEW NETWORK ROUTES ═══╗${NC}"
-  
+  show_section "Network Routing  ›  View Routes"
+
   if [ -d "$ROUTES_DIR" ] && [ "$(ls -A "$ROUTES_DIR" 2>/dev/null)" ]; then
-    echo -e "${YELLOW}Available routes:${NC}"
-    
-    for route_file in "$ROUTES_DIR"/*; do
-      if [ -f "$route_file" ]; then
-        route_name=$(basename "$route_file")
-        echo -e "\n${GREEN}=== $route_name ===${NC}"
-        cat "$route_file"
-        echo -e "${BLUE}------------------------${NC}"
-      fi
+    for rf in "$ROUTES_DIR"/*; do
+      [ -f "$rf" ] || continue
+      local rn; rn=$(basename "$rf")
+      echo -e "\n  ${C_TITLE}${BOLD}── ${rn} $(repeat_char '─' $((44 - ${#rn})))${RESET}"
+      while IFS= read -r line; do echo -e "  ${C_MUTED}${line}${RESET}"; done < "$rf"
+      echo -e "  ${C_BORDER}$(repeat_char '─' 52)${RESET}"
     done
   else
-    echo -e "${YELLOW}No routes found.${NC}"
+    msg_info "No routes configured."
   fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Function to delete a network route
+# ─── Delete route ─────────────────────────────────────────────────────────────
+
 delete_network_route() {
-  show_header
-  echo -e "${CYAN}╔═══ DELETE NETWORK ROUTE ═══╗${NC}"
-  
-  if [ -d "$ROUTES_DIR" ] && [ "$(ls -A "$ROUTES_DIR" 2>/dev/null)" ]; then
-    echo -e "${YELLOW}Available routes:${NC}"
-    ls -1 "$ROUTES_DIR" 2>/dev/null
-    
-    echo -e "\n${YELLOW}Enter route name to delete:${NC} "
-    read -r route_name
-    
-    route_file="$ROUTES_DIR/$route_name"
-    
-    if [ -f "$route_file" ]; then
-      echo -e "${RED}Warning: This will permanently delete the route.${NC}"
-      echo -e "${BLUE}Confirm? (y/n):${NC} "
-      read -r confirm
-      
-      if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # Create a temporary file with commands to remove the route rules
-        temp_file=$(mktemp)
-        
-        # Extract and reverse the iptables commands
-        grep "^iptables -A" "$route_file" | sed 's/-A/-D/g' > "$temp_file"
-        
-        # Ask if user wants to remove the route rules from iptables
-        echo -e "\n${YELLOW}Remove the route rules from iptables? (y/n):${NC} "
-        read -r remove_rules
-        
-        if [[ "$remove_rules" =~ ^[Yy]$ ]]; then
-          # Apply the reversed commands
-          bash "$temp_file"
-          
-          if [ $? -eq 0 ]; then
-            echo -e "${GREEN}Route rules removed successfully!${NC}"
-            
-            # Save iptables rules
-            if command -v iptables-save > /dev/null; then
-              iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules
-            fi
-          else
-            echo -e "${RED}Failed to remove route rules.${NC}"
-          fi
-        fi
-        
-        # Remove the temporary file
-        rm "$temp_file"
-        
-        # Delete the route file
-        rm "$route_file"
-        
-        if [ $? -eq 0 ]; then
-          echo -e "${GREEN}Route deleted successfully!${NC}"
-          log_action "Deleted network route: $route_name"
-        else
-          echo -e "${RED}Failed to delete route file.${NC}"
-        fi
-      else
-        echo -e "${YELLOW}Operation cancelled.${NC}"
-      fi
-    else
-      echo -e "${RED}Route not found.${NC}"
-    fi
-  else
-    echo -e "${YELLOW}No routes found.${NC}"
+  show_section "Network Routing  ›  Delete Route"
+
+  if [ ! -d "$ROUTES_DIR" ] || [ -z "$(ls -A "$ROUTES_DIR" 2>/dev/null)" ]; then
+    msg_info "No routes found."
+    press_enter; return
   fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  echo -e "\n  ${C_SUBTITLE}Available routes:${RESET}"
+  ls -1 "$ROUTES_DIR" 2>/dev/null | while read -r r; do
+    echo -e "  ${C_ACCENT}·${RESET}  ${C_TEXT}${r}${RESET}"
+  done
+
+  ask "Route name to delete"
+  read -r route_name
+  local rf="$ROUTES_DIR/$route_name"
+
+  if [ ! -f "$rf" ]; then
+    msg_err "Route not found."; press_enter; return
+  fi
+
+  msg_warn "This will permanently delete '${route_name}'."
+  ask_confirm "Proceed?" || { msg_warn "Cancelled."; press_enter; return; }
+
+  ask_confirm "Also remove the iptables rules from the active ruleset?" && {
+    local tmp; tmp=$(mktemp)
+    grep "^iptables -A" "$rf" | sed 's/-A/-D/g' > "$tmp"
+    bash "$tmp"
+    [ $? -eq 0 ] && msg_ok "Route rules removed from iptables." || msg_err "Some rules could not be removed."
+    rm "$tmp"
+    command -v iptables-save > /dev/null && \
+      { iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules; }
+  }
+
+  rm "$rf"
+  [ $? -eq 0 ] && { msg_ok "Route '${route_name}' deleted."; log_action "Deleted route: $route_name"; } \
+               || msg_err "Failed to delete route file."
+
+  press_enter
 }
 
-# Function to toggle IP forwarding
+# ─── IP Forwarding toggle ─────────────────────────────────────────────────────
+
 toggle_ip_forwarding() {
-  show_header
-  echo -e "${CYAN}╔═══ IP FORWARDING ═══╗${NC}"
-  
-  # Check current IP forwarding status
-  ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)
-  
-  if [ "$ip_forward" -eq 1 ]; then
-    echo -e "${YELLOW}IP forwarding is currently ${GREEN}ENABLED${NC}${YELLOW}.${NC}"
-    echo -e "${YELLOW}Disable IP forwarding? (y/n):${NC} "
-    read -r disable
-    
-    if [[ "$disable" =~ ^[Yy]$ ]]; then
-      echo 0 > /proc/sys/net/ipv4/ip_forward
-      
-      if [ $? -eq 0 ]; then
-        echo -e "${GREEN}IP forwarding disabled successfully!${NC}"
-        log_action "Disabled IP forwarding"
-        
-        # Update sysctl.conf
-        if [ -f /etc/sysctl.conf ]; then
-          sed -i 's/net.ipv4.ip_forward=1/net.ipv4.ip_forward=0/g' /etc/sysctl.conf
-        fi
-      else
-        echo -e "${RED}Failed to disable IP forwarding.${NC}"
-      fi
-    else
-      echo -e "${YELLOW}Operation cancelled.${NC}"
-    fi
+  show_section "Network Routing  ›  IP Forwarding"
+
+  local cur; cur=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+
+  if [ "$cur" = "1" ]; then
+    echo -e "\n  ${C_LABEL}Current status:${RESET}  ${C_SUCCESS}${BOLD}● ENABLED${RESET}"
+    ask_confirm "Disable IP forwarding?" || { msg_warn "Cancelled."; press_enter; return; }
+    echo 0 > /proc/sys/net/ipv4/ip_forward
+    [ $? -eq 0 ] && {
+      msg_ok "IP forwarding disabled."
+      log_action "Disabled IP forwarding"
+      sed -i 's/net.ipv4.ip_forward=1/net.ipv4.ip_forward=0/g' /etc/sysctl.conf 2>/dev/null
+    } || msg_err "Failed to disable IP forwarding."
   else
-    echo -e "${YELLOW}IP forwarding is currently ${RED}DISABLED${NC}${YELLOW}.${NC}"
-    echo -e "${YELLOW}Enable IP forwarding? (y/n):${NC} "
-    read -r enable
-    
-    if [[ "$enable" =~ ^[Yy]$ ]]; then
-      echo 1 > /proc/sys/net/ipv4/ip_forward
-      
-      if [ $? -eq 0 ]; then
-        echo -e "${GREEN}IP forwarding enabled successfully!${NC}"
-        log_action "Enabled IP forwarding"
-        
-        # Update sysctl.conf
-        if [ -f /etc/sysctl.conf ]; then
-          if grep -q "net.ipv4.ip_forward" /etc/sysctl.conf; then
-            sed -i 's/net.ipv4.ip_forward=0/net.ipv4.ip_forward=1/g' /etc/sysctl.conf
-          else
-            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-          fi
-        fi
+    echo -e "\n  ${C_LABEL}Current status:${RESET}  ${C_ERROR}${BOLD}● DISABLED${RESET}"
+    ask_confirm "Enable IP forwarding?" || { msg_warn "Cancelled."; press_enter; return; }
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    [ $? -eq 0 ] && {
+      msg_ok "IP forwarding enabled."
+      log_action "Enabled IP forwarding"
+      if grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null; then
+        sed -i 's/net.ipv4.ip_forward=0/net.ipv4.ip_forward=1/g' /etc/sysctl.conf
       else
-        echo -e "${RED}Failed to enable IP forwarding.${NC}"
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
       fi
-    else
-      echo -e "${YELLOW}Operation cancelled.${NC}"
-    fi
+    } || msg_err "Failed to enable IP forwarding."
   fi
-  
-  echo -e "\n${BLUE}Press Enter to continue...${NC}"
-  read
+
+  press_enter
 }
 
-# Main menu function
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN MENU
+# ═══════════════════════════════════════════════════════════════════════════════
+
 main_menu() {
   while true; do
     show_header
-    echo -e "${CYAN}╔═══ MAIN MENU ═══╗${NC}"
-    echo -e "${YELLOW}1)${NC} Dashboard"
-    echo -e "${YELLOW}2)${NC} Add Custom Rule"
-    echo -e "${YELLOW}3)${NC} Delete Rules"
-    echo -e "${YELLOW}4)${NC} Profile Management"
-    echo -e "${YELLOW}5)${NC} Quick Toggle"
-    echo -e "${YELLOW}6)${NC} Default Policies"
-    echo -e "${YELLOW}7)${NC} Audit & Monitoring"
-    echo -e "${YELLOW}8)${NC} Preconfigured Rules"
-    echo -e "${YELLOW}9)${NC} Test Mode"
-    echo -e "${YELLOW}10)${NC} Network Routing"
-    echo -e "${YELLOW}0)${NC} Exit"
-    echo -e "${BLUE}Enter your choice (0-10):${NC} "
+
+    echo -e "  ${C_BORDER}╔══ ${C_TITLE}MAIN MENU${RESET} ${C_BORDER}$(repeat_char '═' 44)${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_NUM}[1]${RESET}  ${C_TEXT}Dashboard${RESET}              ${C_MUTED}·${RESET}  ${C_NUM}[6]${RESET}  ${C_TEXT}Default Policies${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_NUM}[2]${RESET}  ${C_TEXT}Add Custom Rule${RESET}        ${C_MUTED}·${RESET}  ${C_NUM}[7]${RESET}  ${C_TEXT}Audit & Monitoring${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_NUM}[3]${RESET}  ${C_TEXT}Delete Rules${RESET}           ${C_MUTED}·${RESET}  ${C_NUM}[8]${RESET}  ${C_TEXT}Preconfigured Rules${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_NUM}[4]${RESET}  ${C_TEXT}Profile Management${RESET}     ${C_MUTED}·${RESET}  ${C_NUM}[9]${RESET}  ${C_TEXT}Test Mode${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_NUM}[5]${RESET}  ${C_TEXT}Quick Toggle${RESET}           ${C_MUTED}·${RESET}  ${C_NUM}[10]${RESET} ${C_TEXT}Network Routing${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}"
+    echo -e "  ${C_BORDER}╟$(repeat_char '─' 54)${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_MUTED}[0]${RESET}  ${C_MUTED}Exit${RESET}"
+    echo -e "  ${C_BORDER}╚$(repeat_char '═' 54)${RESET}"
+
+    echo ""
+    echo -en "  ${C_ACCENT}›${RESET}  ${C_LABEL}Enter your choice${RESET}  ${C_MUTED}(0–10):${RESET}  "
     read -r choice
-    
+
     case $choice in
-      1) show_dashboard ;;
-      2) add_custom_rule ;;
-      3) delete_rules ;;
-      4) manage_profiles ;;
-      5) quick_toggle ;;
-      6) set_default_policies ;;
-      7) audit_and_monitor ;;
-      8) preconfigured_rules ;;
-      9) test_mode ;;
+      1)  show_dashboard ;;
+      2)  add_custom_rule ;;
+      3)  delete_rules ;;
+      4)  manage_profiles ;;
+      5)  quick_toggle ;;
+      6)  set_default_policies ;;
+      7)  audit_and_monitor ;;
+      8)  preconfigured_rules ;;
+      9)  test_mode ;;
       10) manage_network_routing ;;
-      0) 
-        echo -e "${GREEN}Merci d'avoir utilisé Fire-UX !${NC}"
+      0)
+        show_header
+        echo -e "  ${FIRE3}${BOLD}  Au revoir !${RESET}  ${C_MUTED}Fire-UX terminé.${RESET}"
+        echo ""
         exit 0
         ;;
-      *) 
-        echo -e "${RED}Invalid choice. Please try again.${NC}"
+      *)
+        msg_err "Invalid choice — please enter 0 to 10."
         sleep 2
         ;;
     esac
   done
 }
 
-# Check if iptables is installed, and install it if not found
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 if ! command -v iptables &> /dev/null; then
-  echo -e "${YELLOW}iptables n'est pas installé. Tentative d'installation...${NC}"
-  
-  # Check if we have sudo or root privileges
+  echo -e "${C_WARN}  iptables not found. Attempting installation...${RESET}"
   if [ "$EUID" -ne 0 ]; then
-    echo -e "${YELLOW}Privilèges administrateur requis pour installer iptables.${NC}"
-    echo -e "${YELLOW}Exécution de sudo apt update && sudo apt install iptables${NC}"
-    sudo apt update && sudo apt install iptables
+    sudo apt update && sudo apt install -y iptables
   else
-    # Already running as root
-    echo -e "${YELLOW}Exécution de apt update && apt install iptables${NC}"
-    apt update && apt install iptables
+    apt update && apt install -y iptables
   fi
-  
-    # Try to find it in common locations
+
   if ! command -v iptables &> /dev/null; then
-    if [ -f "/sbin/iptables" ]; then
-      echo -e "${GREEN}iptables trouvé dans /sbin/iptables${NC}"
-      # Create a function to use the full path
-      iptables() {
-        /sbin/iptables "$@"
-      }
-      export -f iptables
-    elif [ -f "/usr/sbin/iptables" ]; then
-      echo -e "${GREEN}iptables trouvé dans /usr/sbin/iptables${NC}"
-      # Create a function to use the full path
-      iptables() {
-        /usr/sbin/iptables "$@"
-      }
-      export -f iptables
-    else
-      echo -e "${RED}Échec de l'installation d'iptables. Veuillez l'installer manuellement.${NC}"
-      exit 1
-    fi
-  else
-    echo -e "${GREEN}iptables a été installé avec succès!${NC}"
+    for p in /sbin/iptables /usr/sbin/iptables; do
+      if [ -f "$p" ]; then
+        iptables() { "$p" "$@"; }; export -f iptables
+        break
+      fi
+    done
+    command -v iptables &> /dev/null || { echo -e "${C_ERROR}  ✗  Could not install iptables.${RESET}"; exit 1; }
   fi
 fi
 
-# Test if iptables works
 if ! iptables -V &> /dev/null; then
-  echo -e "${RED}iptables est installé mais ne fonctionne pas correctement.${NC}"
-  echo -e "${YELLOW}Essayez de l'exécuter manuellement avec 'iptables -V' pour voir l'erreur.${NC}"
+  echo -e "${C_ERROR}  ✗  iptables is installed but not working. Run 'iptables -V' to diagnose.${RESET}"
   exit 1
 fi
 
-# Start the script
 log_action "Script started"
 main_menu
