@@ -19,8 +19,10 @@ NC='\033[0m'
 
 # ─── Constantes ──────────────────────────────────────────────────────────────
 readonly INSTALL_BIN="/usr/local/bin/fire-ux"
+readonly LIB_DIR="/usr/local/lib/fire-ux"
 readonly CONFIG_DIR="/etc/fire-ux"
 readonly LOG_FILE="/var/log/fire-ux.log"
+readonly SYSTEMD_SERVICE="/etc/systemd/system/fire-ux-web.service"
 
 # ─── Vérification des droits root ────────────────────────────────────────────
 if [ "${EUID}" -ne 0 ]; then
@@ -59,6 +61,33 @@ fi
 echo ""
 echo -e "${CYAN}Suppression des fichiers Fire-UX...${NC}"
 echo ""
+
+# ─── Arrêt et suppression du service web systemd ─────────────────────────────
+if command -v systemctl &>/dev/null; then
+    if systemctl is-active --quiet fire-ux-web 2>/dev/null; then
+        systemctl stop fire-ux-web 2>/dev/null || true
+        echo -e "${GREEN}  ✔ Service fire-ux-web arrêté${NC}"
+    fi
+    if systemctl is-enabled --quiet fire-ux-web 2>/dev/null; then
+        systemctl disable fire-ux-web 2>/dev/null || true
+    fi
+fi
+
+if [ -f "${SYSTEMD_SERVICE}" ]; then
+    rm -f "${SYSTEMD_SERVICE}"
+    echo -e "${GREEN}  ✔ Service systemd supprimé  : ${SYSTEMD_SERVICE}${NC}"
+    command -v systemctl &>/dev/null && systemctl daemon-reload 2>/dev/null || true
+else
+    echo -e "${YELLOW}  ⚠ Service absent            : ${SYSTEMD_SERVICE}${NC}"
+fi
+
+# ─── Suppression des bibliothèques web ───────────────────────────────────────
+if [ -d "${LIB_DIR}" ]; then
+    rm -rf "${LIB_DIR}"
+    echo -e "${GREEN}  ✔ Bibliothèques web supprimées : ${LIB_DIR}/${NC}"
+else
+    echo -e "${YELLOW}  ⚠ Bibliothèques absentes       : ${LIB_DIR}/${NC}"
+fi
 
 # ─── Suppression du binaire ──────────────────────────────────────────────────
 if [ -f "${INSTALL_BIN}" ]; then

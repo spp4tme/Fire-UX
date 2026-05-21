@@ -59,6 +59,7 @@ CONFIG_DIR="/etc/fire-ux"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 ROUTES_DIR="$CONFIG_DIR/routes"
 LOG_FILE="/var/log/fire-ux.log"
+AUTH_FILE="$CONFIG_DIR/.auth"
 
 mkdir -p "$PROFILES_DIR"
 mkdir -p "$ROUTES_DIR"
@@ -170,6 +171,116 @@ show_header() {
 show_section() {
   show_header
   echo -e "  ${C_MUTED}▸ Main  ▸  ${C_TITLE}${BOLD}${1}${RESET}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+setup_password() {
+  show_header
+  open_box "FIRST-TIME SETUP" 56
+  box_row "${C_SUBTITLE}No password configured. Set one to protect this interface.${RESET}"
+  close_box
+
+  while true; do
+    ask "Create password"
+    read -rs _setup_pass
+    echo ""
+    [ -z "$_setup_pass" ] && { msg_err "Password cannot be empty."; continue; }
+    ask "Confirm password"
+    read -rs _setup_confirm
+    echo ""
+    if [ "$_setup_pass" = "$_setup_confirm" ]; then
+      printf '%s' "$_setup_pass" | sha256sum | awk '{print $1}' > "$AUTH_FILE"
+      chmod 600 "$AUTH_FILE"
+      msg_ok "Password set. Access is now secured."
+      log_action "Password configured"
+      sleep 1
+      return 0
+    else
+      msg_err "Passwords do not match. Try again."
+    fi
+  done
+}
+
+login_screen() {
+  local max_attempts=3
+  local attempt=0
+
+  while [ $attempt -lt $max_attempts ]; do
+    show_header
+    open_box "AUTHENTICATION REQUIRED" 56
+    box_row "${C_SUBTITLE}Enter your password to access Fire-UX.${RESET}"
+    box_row ""
+    box_row "  ${C_MUTED}Attempt: ${C_WARN}$((attempt + 1))${C_MUTED} / ${max_attempts}${RESET}"
+    close_box
+
+    ask "Password"
+    read -rs _login_input
+    echo ""
+
+    local _input_hash _stored_hash
+    _input_hash=$(printf '%s' "$_login_input" | sha256sum | awk '{print $1}')
+    _stored_hash=$(cat "$AUTH_FILE" 2>/dev/null)
+
+    if [ "$_input_hash" = "$_stored_hash" ]; then
+      msg_ok "Access granted."
+      log_action "Login successful"
+      sleep 1
+      return 0
+    else
+      attempt=$((attempt + 1))
+      msg_err "Incorrect password."
+      log_action "Failed login attempt ($attempt/$max_attempts)"
+      sleep 1
+    fi
+  done
+
+  show_header
+  echo -e "  ${C_ERROR}${BOLD}  ✗  Access denied — maximum attempts reached.${RESET}"
+  echo ""
+  log_action "Access denied — max attempts exceeded"
+  exit 1
+}
+
+change_password() {
+  show_section "Change Password"
+
+  ask "Current password"
+  read -rs _cur_pass
+  echo ""
+
+  local _cur_hash _stored_hash
+  _cur_hash=$(printf '%s' "$_cur_pass" | sha256sum | awk '{print $1}')
+  _stored_hash=$(cat "$AUTH_FILE" 2>/dev/null)
+
+  if [ "$_cur_hash" != "$_stored_hash" ]; then
+    msg_err "Incorrect current password."
+    press_enter
+    return
+  fi
+
+  while true; do
+    ask "New password"
+    read -rs _new_pass
+    echo ""
+    [ -z "$_new_pass" ] && { msg_err "Password cannot be empty."; continue; }
+    ask "Confirm new password"
+    read -rs _new_confirm
+    echo ""
+    if [ "$_new_pass" = "$_new_confirm" ]; then
+      printf '%s' "$_new_pass" | sha256sum | awk '{print $1}' > "$AUTH_FILE"
+      chmod 600 "$AUTH_FILE"
+      msg_ok "Password updated successfully."
+      log_action "Password changed"
+      break
+    else
+      msg_err "Passwords do not match. Try again."
+    fi
+  done
+
+  press_enter
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1320,11 +1431,11 @@ main_menu() {
     echo -e "  ${C_BORDER}║${RESET}   ${C_NUM}[5]${RESET}  ${C_TEXT}Quick Toggle${RESET}           ${C_MUTED}·${RESET}  ${C_NUM}[10]${RESET} ${C_TEXT}Network Routing${RESET}"
     echo -e "  ${C_BORDER}║${RESET}"
     echo -e "  ${C_BORDER}╟$(repeat_char '─' 54)${RESET}"
-    echo -e "  ${C_BORDER}║${RESET}   ${C_MUTED}[0]${RESET}  ${C_MUTED}Exit${RESET}"
+    echo -e "  ${C_BORDER}║${RESET}   ${C_MUTED}[11]${RESET} ${C_MUTED}Change Password${RESET}        ${C_MUTED}·${RESET}  ${C_MUTED}[0]${RESET}  ${C_MUTED}Exit${RESET}"
     echo -e "  ${C_BORDER}╚$(repeat_char '═' 54)${RESET}"
 
     echo ""
-    echo -en "  ${C_ACCENT}›${RESET}  ${C_LABEL}Enter your choice${RESET}  ${C_MUTED}(0–10):${RESET}  "
+    echo -en "  ${C_ACCENT}›${RESET}  ${C_LABEL}Enter your choice${RESET}  ${C_MUTED}(0–11):${RESET}  "
     read -r choice
 
     case $choice in
@@ -1338,6 +1449,7 @@ main_menu() {
       8)  preconfigured_rules ;;
       9)  test_mode ;;
       10) manage_network_routing ;;
+      11) change_password ;;
       0)
         show_header
         echo -e "  ${FIRE3}${BOLD}  Au revoir !${RESET}  ${C_MUTED}Fire-UX terminé.${RESET}"
@@ -1345,7 +1457,7 @@ main_menu() {
         exit 0
         ;;
       *)
-        msg_err "Invalid choice — please enter 0 to 10."
+        msg_err "Invalid choice — please enter 0 to 11."
         sleep 2
         ;;
     esac
@@ -1381,4 +1493,8 @@ if ! iptables -V &> /dev/null; then
 fi
 
 log_action "Script started"
+
+[ ! -f "$AUTH_FILE" ] && setup_password
+login_screen
+
 main_menu

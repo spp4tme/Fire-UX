@@ -14,7 +14,7 @@ TEST_DIR         := tests/
 
 .DEFAULT_GOAL := help
 
-.PHONY: install uninstall test audit lint help
+.PHONY: install uninstall test audit lint web-start web-stop web-status web-log help
 
 install: ## Installe Fire-UX sur le système (requiert root)
 	@sudo bash $(INSTALL_SCRIPT)
@@ -44,6 +44,18 @@ lint: ## Analyse statique du code Bash avec shellcheck
 		echo "Erreur : shellcheck n'est pas installé."; \
 		exit 1; \
 	fi
+
+web-start: ## Démarre le service web Fire-UX (interface sur :8080)
+	@sudo systemctl start fire-ux-web
+
+web-stop: ## Arrête le service web Fire-UX
+	@sudo systemctl stop fire-ux-web
+
+web-status: ## Affiche l'état du service web Fire-UX
+	@systemctl status fire-ux-web
+
+web-log: ## Suit les journaux du service web Fire-UX en temps réel
+	@journalctl -u fire-ux-web -f
 
 help: ## Affiche cette aide
 	@echo ""

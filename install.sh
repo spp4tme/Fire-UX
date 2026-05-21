@@ -19,11 +19,15 @@ NC='\033[0m'
 
 # ─── Constantes ──────────────────────────────────────────────────────────────
 readonly INSTALL_BIN="/usr/local/bin/fire-ux"
+readonly LIB_DIR="/usr/local/lib/fire-ux"
 readonly CONFIG_DIR="/etc/fire-ux"
 readonly PROFILES_DIR="${CONFIG_DIR}/profiles"
 readonly TIMED_DIR="${CONFIG_DIR}/timed"
 readonly LOG_FILE="/var/log/fire-ux.log"
 readonly SOURCE_SCRIPT="fire-ux.sh"
+readonly WEB_SERVER_SCRIPT="web-server.sh"
+readonly WEB_UI_SCRIPT="web-ui.sh"
+readonly SYSTEMD_SERVICE="/etc/systemd/system/fire-ux-web.service"
 
 # ─── Vérification des droits root ────────────────────────────────────────────
 if [ "${EUID}" -ne 0 ]; then
@@ -145,8 +149,73 @@ install_script() {
     echo ""
 }
 
+# ─── Installation des fichiers de l'interface web ────────────────────────────
+install_web() {
+    echo -e "${CYAN}Installation de l'interface web Fire-UX...${NC}"
+
+    mkdir -p "${LIB_DIR}"
+    chmod 750 "${LIB_DIR}"
+
+    for script in "${WEB_SERVER_SCRIPT}" "${WEB_UI_SCRIPT}"; do
+        if [ ! -f "${script}" ]; then
+            echo -e "${YELLOW}  ⚠ ${script} introuvable — interface web non installée.${NC}"
+            return 0
+        fi
+    done
+
+    cp "${WEB_SERVER_SCRIPT}" "${LIB_DIR}/web-server.sh"
+    cp "${WEB_UI_SCRIPT}"     "${LIB_DIR}/web-ui.sh"
+    chmod +x "${LIB_DIR}/web-server.sh"
+    chmod 644 "${LIB_DIR}/web-ui.sh"
+
+    echo -e "${GREEN}  ${LIB_DIR}/web-server.sh${NC}"
+    echo -e "${GREEN}  ${LIB_DIR}/web-ui.sh${NC}"
+    echo ""
+}
+
+# ─── Création du service systemd pour l'interface web ────────────────────────
+install_web_service() {
+    echo -e "${CYAN}Création du service systemd fire-ux-web...${NC}"
+
+    cat > "${SYSTEMD_SERVICE}" <<EOF
+[Unit]
+Description=Fire-UX Web Interface
+Documentation=https://github.com/spp4tme/iptables-manager
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash ${LIB_DIR}/web-server.sh 8080
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fire-ux-web
+PIDFile=/run/fire-ux-web.pid
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 644 "${SYSTEMD_SERVICE}"
+
+    if command -v systemctl &>/dev/null; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable fire-ux-web 2>/dev/null || true
+        echo -e "${GREEN}  Service systemd créé et activé au démarrage.${NC}"
+    else
+        echo -e "${YELLOW}  systemctl non disponible — démarrage manuel requis.${NC}"
+    fi
+    echo ""
+}
+
 # ─── Résumé de l'installation ────────────────────────────────────────────────
 print_summary() {
+    local main_ip
+    main_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "IP_SERVEUR")
+
     echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}║        Installation réussie !           ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
@@ -156,8 +225,18 @@ print_summary() {
     echo -e "  ${GREEN}Profils      :${NC} ${PROFILES_DIR}/"
     echo -e "  ${GREEN}Timed rules  :${NC} ${TIMED_DIR}/"
     echo -e "  ${GREEN}Journal      :${NC} ${LOG_FILE}"
+    echo -e "  ${GREEN}Web libs     :${NC} ${LIB_DIR}/"
+    echo -e "  ${GREEN}Service web  :${NC} ${SYSTEMD_SERVICE}"
     echo ""
     echo -e "${CYAN}Démarrez Fire-UX avec :${NC} sudo fire-ux"
+    echo ""
+    echo -e "${CYAN}Interface web :${NC}"
+    echo -e "  Démarrer  : ${GREEN}make web-start${NC}  ou  ${GREEN}systemctl start fire-ux-web${NC}"
+    echo -e "  Accès     : ${GREEN}http://${main_ip}:8080${NC}"
+    echo ""
+    echo -e "${YELLOW}⚠  SÉCURITÉ : L'interface web n'a pas d'authentification.${NC}"
+    echo -e "${YELLOW}   Restreignez l'accès au port 8080 via iptables.${NC}"
+    echo -e "${YELLOW}   Consultez docs/WEB.md pour les recommandations.${NC}"
     echo ""
 }
 
@@ -166,4 +245,6 @@ install_deps
 create_dirs
 create_log
 install_script
+install_web
+install_web_service
 print_summary
