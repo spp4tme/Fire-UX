@@ -66,7 +66,7 @@ sudo ./web-server.sh 8080  # Interface web
 ## CLI interactif
 
 ```bash
-sudo fire-ux
+sudo bash fire-ux.sh
 ```
 
 > Doit être lancé en root — `iptables` requiert les privilèges noyau.
