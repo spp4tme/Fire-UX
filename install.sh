@@ -234,9 +234,9 @@ print_summary() {
     echo -e "  Démarrer  : ${GREEN}make web-start${NC}  ou  ${GREEN}systemctl start fire-ux-web${NC}"
     echo -e "  Accès     : ${GREEN}http://${main_ip}:8080${NC}"
     echo ""
-    echo -e "${YELLOW}⚠  SÉCURITÉ : L'interface web n'a pas d'authentification.${NC}"
-    echo -e "${YELLOW}   Restreignez l'accès au port 8080 via iptables.${NC}"
-    echo -e "${YELLOW}   Consultez docs/WEB.md pour les recommandations.${NC}"
+    echo -e "${CYAN}Authentification :${NC}"
+    echo -e "  Configurer : ${GREEN}sudo fire-ux${NC}  (menu → Authentification)"
+    echo -e "  Le mot de passe défini via le CLI active le Basic Auth HTTP."
     echo ""
 }
 

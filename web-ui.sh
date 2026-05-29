@@ -37,7 +37,14 @@ _flash_msg() {
         snapshot_saved)  echo '<div class="flash ok">✓ Snapshot créé.</div>' ;;
         profile_applied) echo '<div class="flash ok">✓ Profil appliqué.</div>' ;;
         profile_deleted) echo '<div class="flash ok">✓ Profil supprimé.</div>' ;;
+        logs_cleared)    echo '<div class="flash ok">✓ Journaux vidés.</div>' ;;
+        chain_created)   echo '<div class="flash ok">✓ Chaîne créée.</div>' ;;
+        chain_deleted)   echo '<div class="flash ok">✓ Chaîne supprimée.</div>' ;;
+        settings_saved)  echo '<div class="flash ok">✓ Paramètres sauvegardés.</div>' ;;
         error_cannot_move) echo '<div class="flash err">✗ Impossible de déplacer (déjà en position limite).</div>' ;;
+        error_builtin_chain) echo '<div class="flash err">✗ Impossible de modifier une chaîne intégrée.</div>' ;;
+        error_chain_exists)  echo '<div class="flash err">✗ Cette chaîne existe déjà.</div>' ;;
+        error_chain_in_use)  echo '<div class="flash err">✗ Chaîne encore référencée — videz-la d'\''abord.</div>' ;;
         error_*)         printf '<div class="flash err">✗ Erreur : %s</div>\n' "${1#error_}" ;;
     esac
 }
@@ -58,7 +65,7 @@ _sec_warnings() {
         out+='<div class="warn wd"><span>⚠</span><div><strong>INPUT DROP sans règle ESTABLISHED/RELATED</strong> — les connexions en cours peuvent être interrompues !</div></div>'
 
     { [ "$pi" = "DROP" ] || [ "$pi" = "REJECT" ]; } && [ "${has_ssh:-0}" -eq 0 ] && \
-        out+='<div class="warn wd"><span>⚠</span><div><strong>INPUT DROP sans règle SSH (port 22)</strong> — risque de perte d'\''accès distant !<br><a href="/apply-preset-get?preset=ssh" style="pointer-events:none;opacity:.5">ou appliquez le preset SSH depuis le dashboard</a></div></div>'
+        out+='<div class="warn wd"><span>⚠</span><div><strong>INPUT DROP sans règle SSH (port 22)</strong> — risque de perte d'\''accès distant !<br><form method="POST" action="/apply-preset" style="display:inline;margin-top:.3rem"><input type="hidden" name="preset" value="ssh"><button class="btn btn-sm btn-d" type="submit" style="margin-top:.28rem" onclick="return confirm('\''Appliquer le preset SSH maintenant ?'\'')">Appliquer preset SSH</button></form></div></div>'
 
     { [ "$po" = "DROP" ] || [ "$po" = "REJECT" ]; } && \
         out+='<div class="warn ww"><span>⚠</span><span>Politique OUTPUT DROP — le trafic sortant est bloqué par défaut.</span></div>'
@@ -498,7 +505,9 @@ function toast(msg,type='info',dur=3400){
     rule_deleted:['Règle supprimée','ok'],rule_moved:['Règle déplacée','ok'],
     chain_flushed:['Chaîne vidée','ok'],all_flushed:['Toutes les chaînes vidées','ok'],
     snapshot_saved:['Snapshot créé','ok'],profile_applied:['Profil appliqué','ok'],
-    profile_deleted:['Profil supprimé','ok']};
+    profile_deleted:['Profil supprimé','ok'],logs_cleared:['Journaux vidés','ok'],
+    chain_created:['Chaîne créée','ok'],chain_deleted:['Chaîne supprimée','ok'],
+    settings_saved:['Paramètres sauvegardés','ok']};
   if(m){const d=map[m];d?toast(...d):m.startsWith('error_')&&toast('Erreur : '+m.replace(/error_/,''),'err');
     const u=new URL(location);u.searchParams.delete('msg');history.replaceState({},'',u)}
 })();
@@ -525,6 +534,11 @@ async function fetchStats(){
     if(_ch){_ch.data.datasets[0].data=[d.rules_input||0,d.rules_output||0,d.rules_forward||0];_ch.update('none')}
     _updateGauge('cpu-gauge',d.cpu_pct||0);
     _updateGauge('mem-gauge',d.mem_pct||0);
+    const si6=document.getElementById('si6');const so6=document.getElementById('so6');
+    const sf6=document.getElementById('sf6');const st6=document.getElementById('st6');
+    if(si6)cnt(si6,d.rules_input6||0);if(so6)cnt(so6,d.rules_output6||0);
+    if(sf6)cnt(sf6,d.rules_forward6||0);
+    if(st6)cnt(st6,(d.rules_input6||0)+(d.rules_output6||0)+(d.rules_forward6||0));
   }catch(e){}
 }
 
@@ -638,6 +652,7 @@ document.addEventListener('keydown',e=>{
 
 // ── Dynamic refresh interval ──────────────────────────────────────────────────
 const _ri=parseInt(localStorage.getItem('refresh')||'4')*1000;
+const _ril=document.getElementById('ri-lbl');if(_ril)_ril.textContent=parseInt(localStorage.getItem('refresh')||'4');
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 (async()=>{
@@ -659,7 +674,7 @@ page_dashboard() {
     local pi po pf ci co cf ct uv hn iv
     local ncpu load cpu_pct cpu_deg cpu_color
     local mem_t mem_f mem_used mem_pct mem_deg mem_color
-    local conns
+    local conns ci6=0 co6=0 cf6=0 ct6=0 has_ip6=0
 
     pi=$(iptables -L INPUT   2>/dev/null|head -1|awk '{print $4}'|tr -d ')')
     po=$(iptables -L OUTPUT  2>/dev/null|head -1|awk '{print $4}'|tr -d ')')
@@ -668,6 +683,13 @@ page_dashboard() {
     co=$(iptables -L OUTPUT  --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l)
     cf=$(iptables -L FORWARD --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l)
     ct=$((ci+co+cf))
+    if command -v ip6tables &>/dev/null; then
+        has_ip6=1
+        ci6=$(ip6tables -L INPUT   --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l||echo 0)
+        co6=$(ip6tables -L OUTPUT  --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l||echo 0)
+        cf6=$(ip6tables -L FORWARD --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l||echo 0)
+        ct6=$((ci6+co6+cf6))
+    fi
     uv=$(uptime -p 2>/dev/null|sed 's/up //'||uptime|sed 's/.*up //;s/,.*//')
     hn=$(hostname 2>/dev/null||echo "—")
     iv=$(hostname -I 2>/dev/null|awk '{print $1}'||echo "—")
@@ -736,6 +758,31 @@ WEOF
   </div>
 </div>
 STATSEOF
+
+    if [ "${has_ip6}" -eq 1 ]; then
+        cat << IP6EOF
+<div class="card" style="border-color:rgba(124,58,237,.22)">
+  <div class="card-hd">
+    <div class="card-t" style="color:var(--ac2)"><span class="ic">⊕</span> IPv6 — ip6tables</div>
+    <a href="/rules?v=6" class="btn btn-sm" style="border-color:rgba(124,58,237,.3);color:var(--ac2)">Gérer →</a>
+  </div>
+  <div class="srow" style="margin-bottom:0">
+    <div class="sc" style="border-color:rgba(124,58,237,.15)">
+      <div class="sl">INPUT6</div><div class="sv p" id="si6">${ci6}</div>
+    </div>
+    <div class="sc" style="border-color:rgba(124,58,237,.15)">
+      <div class="sl">OUTPUT6</div><div class="sv p" id="so6">${co6}</div>
+    </div>
+    <div class="sc" style="border-color:rgba(124,58,237,.15)">
+      <div class="sl">FORWARD6</div><div class="sv p" id="sf6">${cf6}</div>
+    </div>
+    <div class="sc" style="border-color:rgba(124,58,237,.15)">
+      <div class="sl">Total IPv6</div><div class="sv p" id="st6">${ct6}</div>
+    </div>
+  </div>
+</div>
+IP6EOF
+    fi
 
     # System + gauges
     cat << SYSEOF
@@ -814,7 +861,7 @@ $(
             3306)  sname="MySQL" ;;   5432) sname="PgSQL" ;;   6379) sname="Redis" ;;
             8080)  sname="HTTP-alt" ;;51820) sname="WireGuard" ;;*)  sname="port ${pnum}" ;;
         esac
-        local ia; ia=$(iptables -L INPUT -n 2>/dev/null|grep "dpt:${pnum}"|grep -c ACCEPT||echo 0)
+        local ia; ia=$(iptables -L INPUT -n 2>/dev/null|grep "dpt:${pnum}"|grep -c ACCEPT 2>/dev/null); ia=${ia:-0}
         if [ "${ia}" -gt 0 ]; then
             printf '      <span class="pc po" title="ACCEPT dans iptables">%s:%s ✓</span>\n' "${sname}" "${pnum}"
         else
@@ -882,7 +929,7 @@ QEOF
 <div class="card">
   <div class="card-hd">
     <div class="card-t"><span class="ic">◫</span> Répartition des règles</div>
-    <span class="mu" style="font-size:.7rem;font-family:var(--mo)">mis à jour toutes les ${$( [ "$(localStorage.getItem('refresh') 2>/dev/null||echo 4)" ] && echo 4 || echo 4 )}s</span>
+    <span class="mu" style="font-size:.7rem;font-family:var(--mo)">mis à jour toutes les <span id="ri-lbl">4</span>s</span>
   </div>
   <div class="chwrap"><canvas id="rChart"></canvas></div>
 </div>
@@ -938,15 +985,28 @@ CHARTEOF
 # ── page_rules ────────────────────────────────────────────────────────────────
 page_rules() {
     local fm; fm=$(printf '%s' "${QUERY_STRING:-}"|grep -oE 'msg=[^&]*'|cut -d= -f2)
+    local ipver; ipver=$(printf '%s' "${QUERY_STRING:-}"|grep -oE 'v=[^&]*'|cut -d= -f2)
+    [ "$ipver" = "6" ] && local _ipt="ip6tables" || local _ipt="iptables"
+    local has_ip6=0; command -v ip6tables &>/dev/null && has_ip6=1
 
     html_header "Règles iptables" "rules"
     printf '<div class="pt"><span class="ic">⊟</span> Règles iptables</div>\n'
     [ -n "${fm}" ] && _flash_msg "${fm}"
 
+    # ── Onglet IPv4 / IPv6 ───────────────────────────────────────────────────
+    if [ "${has_ip6}" -eq 1 ]; then
+        local t4="" t6=""
+        [ "$ipver" = "6" ] && t6=' style="background:rgba(124,58,237,.12);border-color:rgba(124,58,237,.4);color:var(--ac2)"' || t4=' style="background:rgba(0,210,255,.1);border-color:var(--ac);color:var(--ac)"'
+        printf '<div style="display:flex;gap:.4rem;margin-bottom:.9rem">\n'
+        printf '  <a href="/rules" class="btn btn-sm btn-s"%s>IPv4 iptables</a>\n' "${t4}"
+        printf '  <a href="/rules?v=6" class="btn btn-sm btn-s"%s>IPv6 ip6tables</a>\n' "${t6}"
+        printf '</div>\n'
+    fi
+
     _chain_table() {
         local ch="$1"
         local raw total_rules
-        raw=$(iptables -L "${ch}" --line-numbers -n 2>/dev/null||true)
+        raw=$("${_ipt}" -L "${ch}" --line-numbers -n 2>/dev/null||true)
         total_rules=$(printf '%s' "${raw}"|tail -n+3|grep -v '^$'|wc -l)
 
         cat << CHTEOF
@@ -958,6 +1018,7 @@ page_rules() {
       <a href="/export" class="btn btn-sm btn-s" title="Exporter toutes les règles">↓</a>
       <form method="POST" action="/flush" style="display:inline">
         <input type="hidden" name="chain" value="${ch}">
+        <input type="hidden" name="ipt" value="${ipver:-4}">
         <button class="btn btn-sm btn-d" type="submit" onclick="return confirm('Vider la chaîne ${ch} ?')">⊘ Vider</button>
       </form>
     </div>
@@ -998,17 +1059,17 @@ CHTEOF
       <td style="color:var(--mu);font-size:.74rem;max-width:180px">${opts}</td>
       <td style="text-align:center;white-space:nowrap">
         <form method="POST" action="/move-rule" style="display:inline">
-          <input type="hidden" name="num" value="${num}"><input type="hidden" name="chain" value="${ch}"><input type="hidden" name="dir" value="up">
+          <input type="hidden" name="num" value="${num}"><input type="hidden" name="chain" value="${ch}"><input type="hidden" name="dir" value="up"><input type="hidden" name="ipt" value="${ipver:-4}">
           <button class="btn btn-sm btn-s" type="submit" title="Monter"${up_dis}>↑</button>
         </form>
         <form method="POST" action="/move-rule" style="display:inline">
-          <input type="hidden" name="num" value="${num}"><input type="hidden" name="chain" value="${ch}"><input type="hidden" name="dir" value="down">
+          <input type="hidden" name="num" value="${num}"><input type="hidden" name="chain" value="${ch}"><input type="hidden" name="dir" value="down"><input type="hidden" name="ipt" value="${ipver:-4}">
           <button class="btn btn-sm btn-s" type="submit" title="Descendre"${dn_dis}>↓</button>
         </form>
       </td>
       <td>
         <form method="POST" action="/delete-rule" style="display:inline">
-          <input type="hidden" name="num" value="${num}"><input type="hidden" name="chain" value="${ch}">
+          <input type="hidden" name="num" value="${num}"><input type="hidden" name="chain" value="${ch}"><input type="hidden" name="ipt" value="${ipver:-4}">
           <button class="btn btn-sm btn-d" type="submit" onclick="return confirm('Supprimer règle #${num} de ${ch} ?')" title="Supprimer">✕</button>
         </form>
       </td>
@@ -1024,10 +1085,32 @@ ROWEOF
 
     for ch in INPUT OUTPUT FORWARD; do _chain_table "${ch}"; done
 
+    # Chaînes personnalisées
+    local custom_chains
+    custom_chains=$("${_ipt}" -L --line-numbers -n 2>/dev/null | grep '^Chain' | awk '{print $2}' | grep -vE '^(INPUT|OUTPUT|FORWARD)$' || true)
+    if [ -n "${custom_chains}" ]; then
+        printf '<div class="card"><div class="card-hd"><div class="card-t"><span class="ic">◧</span> Chaînes personnalisées</div></div>\n'
+        printf '<div style="display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.7rem">\n'
+        for cch in ${custom_chains}; do
+            local ccount; ccount=$("${_ipt}" -L "${cch}" --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l)
+            printf '<span class="badge bp" style="font-size:.76rem;padding:.2rem .6rem">%s <span style="color:var(--mu);margin-left:.3rem">%s règle(s)</span></span>\n' "${cch}" "${ccount}"
+        done
+        printf '</div>\n'
+        printf '<div style="display:flex;gap:.4rem;flex-wrap:wrap">\n'
+        for cch in ${custom_chains}; do
+            printf '<form method="POST" action="/delete-chain" style="display:inline"><input type="hidden" name="name" value="%s"><input type="hidden" name="ipt" value="%s"><button class="btn btn-sm btn-d" type="submit" onclick="return confirm('"'"'Supprimer la chaîne %s ?'"'"')">✕ %s</button></form>\n' "${cch}" "${ipver:-4}" "${cch}" "${cch}"
+        done
+        printf '</div></div>\n'
+    fi
+
     cat << FORMEOF
 <div class="card">
-  <div class="card-hd"><div class="card-t"><span class="ic">⊕</span> Ajouter une règle</div></div>
+  <div class="card-hd">
+    <div class="card-t"><span class="ic">⊕</span> Ajouter une règle</div>
+    <span class="badge $([ "${ipver}" = "6" ]&&echo bp||echo bb)">$([ "${ipver}" = "6" ]&&echo "IPv6 ip6tables"||echo "IPv4 iptables")</span>
+  </div>
   <form method="POST" action="/add-rule">
+    <input type="hidden" name="ipt" value="${ipver:-4}">
     <div class="fgrid">
       <div class="fg"><label>Chaîne</label>
         <select name="chain"><option value="INPUT">INPUT</option><option value="OUTPUT">OUTPUT</option><option value="FORWARD">FORWARD</option></select></div>
@@ -1039,9 +1122,21 @@ ROWEOF
         <input type="text" name="src" placeholder="192.168.1.0/24"></div>
       <div class="fg"><label>Action</label>
         <select name="action"><option value="ACCEPT">ACCEPT</option><option value="DROP">DROP</option><option value="REJECT">REJECT</option></select></div>
+      <div class="fg"><label>Commentaire (optionnel)</label>
+        <input type="text" name="comment" placeholder="ex : Allow HTTP" maxlength="64"></div>
       <div class="fg"><label>&nbsp;</label>
         <button class="btn btn-p" type="submit">⊕ Ajouter</button></div>
     </div>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-hd"><div class="card-t"><span class="ic">◧</span> Créer une chaîne personnalisée</div></div>
+  <form method="POST" action="/add-chain" style="display:flex;gap:.5rem;align-items:flex-end;flex-wrap:wrap">
+    <input type="hidden" name="ipt" value="${ipver:-4}">
+    <div class="fg" style="flex:1;min-width:160px"><label>Nom de la chaîne</label>
+      <input type="text" name="name" placeholder="ex : MY_CHAIN" maxlength="28" pattern="[a-zA-Z0-9_-]+" required></div>
+    <button class="btn btn-g" type="submit">⊕ Créer</button>
   </form>
 </div>
 FORMEOF
@@ -1068,6 +1163,9 @@ page_logs() {
     </select>
     <button id="arb" class="btn btn-sm btn-s">⏸ Pause</button>
     <button onclick="const b=document.getElementById('lb');b&&(b.scrollTop=b.scrollHeight)" class="btn btn-sm btn-s">↓ Bas</button>
+    <form method="POST" action="/clear-logs" style="display:inline" onsubmit="return confirm('Vider tous les journaux ?')">
+      <button class="btn btn-sm btn-d" type="submit">⊘ Vider</button>
+    </form>
     <span style="margin-left:auto;font-family:var(--mo);font-size:.67rem;color:var(--mu)">
       total : <span id="logcnt">${log_count}</span> · 5s
     </span>
@@ -1100,8 +1198,9 @@ page_profiles() {
 <div class="card">
   <div class="card-hd">
     <div class="card-t"><span class="ic">◫</span> Profils iptables</div>
-    <form method="POST" action="/save-snapshot" style="display:inline">
-      <button class="btn btn-sm btn-g" type="submit">💾 Snapshot actuel</button>
+    <form method="POST" action="/save-snapshot" style="display:inline;display:flex;gap:.4rem;align-items:center">
+      <input type="text" name="name" placeholder="Nom (optionnel)" maxlength="48" style="width:180px;padding:.22rem .52rem;font-size:.71rem">
+      <button class="btn btn-sm btn-g" type="submit">💾 Snapshot</button>
     </form>
   </div>
 PROFEOF
@@ -1197,6 +1296,25 @@ IFEOF
     done < <(ip route show 2>/dev/null||true)
     echo '</tbody></table></div></div>'
 
+    # Listening ports
+    echo '<div class="card"><div class="card-hd"><div class="card-t"><span class="ic">⊡</span> Ports en écoute</div></div>'
+    echo '<div class="tw"><table><thead><tr><th>Proto</th><th>Adresse locale</th><th>PID / Processus</th></tr></thead><tbody>'
+    local lc=0
+    while IFS= read -r lline; do
+        [ -z "${lline}" ] && continue
+        local lproto laddr lpid
+        lproto=$(echo "${lline}" | awk '{print $1}')
+        laddr=$(echo "${lline}"  | awk '{print $4}')
+        lpid=$(echo "${lline}"   | awk '{print $6}' | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+        local lpname="—"
+        [ -n "${lpid}" ] && lpname=$(cat "/proc/${lpid}/comm" 2>/dev/null || echo "pid ${lpid}")
+        printf '  <tr><td><span class="badge bg">%s</span></td><td style="font-family:var(--mo);font-size:.78rem">%s</td><td style="color:var(--mu);font-size:.75rem">%s</td></tr>\n' \
+            "${lproto}" "${laddr}" "${lpname}"
+        lc=$((lc+1))
+    done < <(ss -tlnp 2>/dev/null | tail -n+2 | grep -v '^$' || true)
+    [ "${lc}" -eq 0 ] && echo '  <tr><td colspan="3" class="mu" style="text-align:center;padding:.8rem">Aucun port en écoute détecté</td></tr>'
+    echo '</tbody></table></div></div>'
+
     # Active connections
     local cc; cc=$(ss -tn state established 2>/dev/null|tail -n+2|wc -l||echo 0)
     echo '<div class="card">'
@@ -1220,7 +1338,15 @@ IFEOF
 # ── page_settings ─────────────────────────────────────────────────────────────
 page_settings() {
     local pid_val; pid_val="${SERVER_PID:-—}"
+    local fm; fm=$(printf '%s' "${QUERY_STRING:-}"|grep -oE 'msg=[^&]*'|cut -d= -f2)
+    local conf="/etc/fire-ux/web.conf"
+    local cur_port="8080"
+    [ -f "${conf}" ] && { cur_port=$(grep -oP 'WEB_PORT=\K[0-9]+' "${conf}" 2>/dev/null || echo "8080"); }
+    local auth_status="Désactivée"
+    [ -f "/etc/fire-ux/.auth" ] && [ -s "/etc/fire-ux/.auth" ] && auth_status="Activée (mot de passe défini)"
+
     html_header "Paramètres" "settings"
+    [ -n "${fm}" ] && _flash_msg "${fm}"
 
     cat << 'SETEOF'
 <div class="pt"><span class="ic">⚙</span> Paramètres</div>
@@ -1302,6 +1428,11 @@ page_settings() {
       <tr><td>/delete-rule</td><td><span class="badge by">POST</span></td><td>Supprimer une règle</td></tr>
       <tr><td>/move-rule</td><td><span class="badge by">POST</span></td><td>Déplacer une règle (up/down)</td></tr>
       <tr><td>/apply-preset</td><td><span class="badge by">POST</span></td><td>Appliquer un preset</td></tr>
+      <tr><td><a href="/api/rules?chain=INPUT" style="color:var(--ac)">/api/rules?chain=INPUT</a></td><td><span class="badge bg">GET</span></td><td>JSON règles d'une chaîne (param: chain, v=6)</td></tr>
+      <tr><td>/clear-logs</td><td><span class="badge by">POST</span></td><td>Vider le fichier journal</td></tr>
+      <tr><td>/add-chain</td><td><span class="badge by">POST</span></td><td>Créer une chaîne personnalisée</td></tr>
+      <tr><td>/delete-chain</td><td><span class="badge by">POST</span></td><td>Supprimer une chaîne personnalisée</td></tr>
+      <tr><td>/save-settings</td><td><span class="badge by">POST</span></td><td>Sauvegarder les paramètres serveur</td></tr>
     </tbody>
   </table></div>
 </div>
@@ -1318,6 +1449,18 @@ SETEOF
   </div>
 </div>
 SETEOF2
+
+    # Paramètres serveur
+    printf '<div class="card">\n'
+    printf '<div class="card-hd"><div class="card-t"><span class="ic">⊞</span> Configuration serveur</div></div>\n'
+    printf '<form method="POST" action="/save-settings">\n'
+    printf '<div class="set-row"><div class="set-info"><div class="set-lbl">Port HTTP</div><div class="set-desc">Port d'\''écoute du serveur web (redémarrage requis)</div></div>\n'
+    printf '<div class="set-ctrl"><input type="number" name="port" value="%s" min="1024" max="65535" style="width:100px"></div></div>\n' "${cur_port}"
+    printf '<div class="set-row"><div class="set-info"><div class="set-lbl">Authentification HTTP Basic</div><div class="set-desc">Configurez le mot de passe avec <code>fire-ux</code> (CLI) → section auth</div></div>\n'
+    printf '<div class="set-ctrl"><span class="badge %s">%s</span></div></div>\n' \
+        "$([ "${auth_status}" = "Désactivée" ] && echo "bd" || echo "ba")" "${auth_status}"
+    printf '<div style="margin-top:.8rem"><button class="btn btn-p" type="submit">Sauvegarder</button></div>\n'
+    printf '</form>\n</div>\n'
 
     html_footer
 }

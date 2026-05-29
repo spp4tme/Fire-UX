@@ -59,6 +59,20 @@ else
     exit 1
 fi
 
+# ─── Arrêt de toute instance existante ───────────────────────────────────────
+_PID_FILE="/run/fire-ux-web.pid"
+if [ -f "${_PID_FILE}" ]; then
+    _OLD_PID=$(cat "${_PID_FILE}" 2>/dev/null)
+    if [ -n "${_OLD_PID}" ] && kill -0 "${_OLD_PID}" 2>/dev/null; then
+        echo "Arrêt de l'instance existante (PID ${_OLD_PID})…" >&2
+        kill "${_OLD_PID}" 2>/dev/null || true
+        sleep 1
+    fi
+fi
+# Libérer le port si encore occupé
+fuser -k "${WEB_PORT}/tcp" 2>/dev/null || true
+sleep 0.5
+
 # ─── Enregistrement du PID ────────────────────────────────────────────────────
 echo $$ > /run/fire-ux-web.pid
 

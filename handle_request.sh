@@ -1,10 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# handle_request.sh v2.1 — Gestionnaire HTTP Fire-UX
+# handle_request.sh v2.2 — Gestionnaire HTTP Fire-UX
 # =============================================================================
 
 # ── Étape 1 : lecture stdin ───────────────────────────────────────────────────
-_method="" _path="/" _content_length=0 _first=true
+_method="" _path="/" _content_length=0 _first=true _auth_header=""
 
 while IFS= read -r -t 2 line; do
     [[ "$line" == $'\r' || -z "$line" ]] && break
@@ -13,6 +13,8 @@ while IFS= read -r -t 2 line; do
         _rest="${line#* }"; _path="${_rest%% *}"
     elif [[ "$line" =~ ^[Cc]ontent-[Ll]ength:[[:space:]]*([0-9]+) ]]; then
         _content_length="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[Aa]uthorization:[[:space:]]*(.*) ]]; then
+        _auth_header="${BASH_REMATCH[1]%$'\r'}"
     fi
 done
 
@@ -35,6 +37,7 @@ else
 fi
 SERVER_PID="$(cat /run/fire-ux-web.pid 2>/dev/null || printf '—')"
 
+
 # ── Helpers HTTP ──────────────────────────────────────────────────────────────
 _send_html() {
     local body="$1" len; len="$(printf '%s' "$body"|wc -c)"
@@ -56,10 +59,13 @@ _send_404() {
     printf "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" "$len" "$body"
 }
 
-# ── Paramètres POST ───────────────────────────────────────────────────────────
+# ── Paramètres POST / GET ─────────────────────────────────────────────────────
 _urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
 _param() {
     local raw; raw="$(printf '%s' "$1"|grep -oE "$2=[^&]*"|head -1|cut -d= -f2-)"; _urldecode "$raw"
+}
+_qparam() {
+    local raw; raw="$(printf '%s' "${QUERY_STRING:-}"|grep -oE "$1=[^&]*"|head -1|cut -d= -f2-)"; _urldecode "$raw"
 }
 
 # ── Handlers POST ─────────────────────────────────────────────────────────────
@@ -103,21 +109,26 @@ _handle_apply_preset() {
 }
 
 _handle_add_rule() {
-    local chain proto port src action
-    chain="$(_param "$_post_body" "chain")"; proto="$(_param "$_post_body" "proto")"
-    port="$(_param  "$_post_body" "port")";  src="$(_param "$_post_body" "src")"
-    action="$(_param "$_post_body" "action")"
+    local chain proto port src action comment ipt
+    chain="$(_param "$_post_body" "chain")";  proto="$(_param "$_post_body" "proto")"
+    port="$(_param  "$_post_body" "port")";   src="$(_param "$_post_body" "src")"
+    action="$(_param "$_post_body" "action")"; comment="$(_param "$_post_body" "comment")"
+    ipt="$(_param "$_post_body" "ipt")"; [[ "$ipt" == "6" ]] && ipt="ip6tables" || ipt="iptables"
+
     case "$chain"  in INPUT|OUTPUT|FORWARD) ;; *) _send_redirect "/rules?msg=error_invalid_chain";  return ;; esac
     case "$proto"  in tcp|udp|icmp|all)    ;; *) _send_redirect "/rules?msg=error_invalid_proto";  return ;; esac
     case "$action" in ACCEPT|DROP|REJECT)  ;; *) _send_redirect "/rules?msg=error_invalid_action"; return ;; esac
     if [[ -n "$port" ]] && ! [[ "$port" =~ ^[0-9]{1,5}(:[0-9]{1,5})?$ ]]; then
         _send_redirect "/rules?msg=error_invalid_port"; return; fi
-    if [[ -n "$src" ]] && ! [[ "$src" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]]; then
+    if [[ -n "$src" ]] && ! [[ "$src" =~ ^[0-9a-fA-F:.]{2,}(/[0-9]{1,3})?$ ]]; then
         _send_redirect "/rules?msg=error_invalid_src"; return; fi
-    local -a cmd=( iptables -A "$chain" )
+    comment="$(printf '%s' "$comment" | tr -cd '[:alnum:] ._-' | head -c 64)"
+
+    local -a cmd=( "$ipt" -A "$chain" )
     [[ "$proto" != "all" ]] && cmd+=( -p "$proto" )
     [[ -n "$port" && "$proto" != "icmp" && "$proto" != "all" ]] && cmd+=( --dport "$port" )
     [[ -n "$src" ]] && cmd+=( -s "$src" )
+    [[ -n "$comment" ]] && cmd+=( -m comment --comment "$comment" )
     cmd+=( -j "$action" )
     if "${cmd[@]}" 2>/dev/null; then
         printf '%s - Règle ajoutée : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${cmd[*]}" >> /var/log/fire-ux.log
@@ -126,25 +137,27 @@ _handle_add_rule() {
 }
 
 _handle_delete_rule() {
-    local num chain
+    local num chain ipt
     num="$(_param "$_post_body" "num")"; chain="$(_param "$_post_body" "chain")"
+    ipt="$(_param "$_post_body" "ipt")"; [[ "$ipt" == "6" ]] && ipt="ip6tables" || ipt="iptables"
     case "$chain" in INPUT|OUTPUT|FORWARD) ;; *) _send_redirect "/rules?msg=error_invalid_chain"; return ;; esac
     [[ "$num" =~ ^[0-9]+$ ]] || { _send_redirect "/rules?msg=error_invalid_num"; return; }
-    if iptables -D "$chain" "$num" 2>/dev/null; then
+    if "$ipt" -D "$chain" "$num" 2>/dev/null; then
         printf '%s - Règle #%s supprimée de %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$num" "$chain" >> /var/log/fire-ux.log
         _send_redirect "/rules?msg=rule_deleted"
     else _send_redirect "/rules?msg=error_delete_failed"; fi
 }
 
 _handle_move_rule() {
-    local num chain dir
+    local num chain dir ipt
     num="$(_param "$_post_body" "num")"; chain="$(_param "$_post_body" "chain")"
     dir="$(_param "$_post_body" "dir")"
+    ipt="$(_param "$_post_body" "ipt")"; [[ "$ipt" == "6" ]] && ipt="ip6tables" || ipt="iptables"
     case "$chain" in INPUT|OUTPUT|FORWARD) ;; *) _send_redirect "/rules?msg=error_invalid_chain"; return ;; esac
     [[ "$num" =~ ^[0-9]+$ ]] || { _send_redirect "/rules?msg=error_invalid_num"; return; }
     case "$dir" in up|down) ;; *) _send_redirect "/rules?msg=error_invalid_dir"; return ;; esac
     local total
-    total=$(iptables -L "$chain" --line-numbers -n 2>/dev/null | tail -n+3 | grep -v '^$' | wc -l)
+    total=$("$ipt" -L "$chain" --line-numbers -n 2>/dev/null | tail -n+3 | grep -v '^$' | wc -l)
     [ "$total" -lt 2 ] && { _send_redirect "/rules?msg=error_cannot_move"; return; }
     local new_pos
     if [ "$dir" = "up" ]; then
@@ -154,13 +167,12 @@ _handle_move_rule() {
         [ "$num" -ge "$total" ] && { _send_redirect "/rules?msg=error_cannot_move"; return; }
         new_pos=$((num + 1))
     fi
-    # Get rule spec, delete it, re-insert at new position
     local spec
-    spec=$(iptables -S "$chain" 2>/dev/null | tail -n+2 | sed -n "${num}p" | sed "s/^-A $chain //" )
+    spec=$("$ipt" -S "$chain" 2>/dev/null | tail -n+2 | sed -n "${num}p" | sed "s/^-A $chain //")
     [ -z "$spec" ] && { _send_redirect "/rules?msg=error_delete_failed"; return; }
-    if iptables -D "$chain" "$num" 2>/dev/null; then
+    if "$ipt" -D "$chain" "$num" 2>/dev/null; then
         local -a insert_cmd
-        read -ra insert_cmd <<< "iptables -I $chain $new_pos $spec"
+        read -ra insert_cmd <<< "$ipt -I $chain $new_pos $spec"
         if "${insert_cmd[@]}" 2>/dev/null; then
             printf '%s - Règle déplacée (%s→%s) dans %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$num" "$new_pos" "$chain" >> /var/log/fire-ux.log
             _send_redirect "/rules?msg=rule_moved"
@@ -171,14 +183,16 @@ _handle_move_rule() {
 }
 
 _handle_flush() {
-    local chain; chain="$(_param "$_post_body" "chain")"
+    local chain ipt
+    chain="$(_param "$_post_body" "chain")"
+    ipt="$(_param "$_post_body" "ipt")"; [[ "$ipt" == "6" ]] && ipt="ip6tables" || ipt="iptables"
     case "$chain" in
         INPUT|OUTPUT|FORWARD)
-            iptables -F "$chain" 2>/dev/null||true
+            "$ipt" -F "$chain" 2>/dev/null||true
             printf '%s - Chaîne %s vidée\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$chain" >> /var/log/fire-ux.log
             _send_redirect "/rules?msg=chain_flushed" ;;
         all)
-            iptables -F 2>/dev/null||true
+            "$ipt" -F 2>/dev/null||true
             printf '%s - Toutes les chaînes vidées\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/fire-ux.log
             _send_redirect "/rules?msg=all_flushed" ;;
         *) _send_redirect "/rules?msg=error_invalid_chain" ;;
@@ -186,9 +200,11 @@ _handle_flush() {
 }
 
 _handle_save_snapshot() {
-    local dir="/etc/fire-ux/profiles" ts; mkdir -p "$dir"; ts="$(date +%Y%m%d%H%M%S)"
-    if iptables-save > "${dir}/snapshot_${ts}" 2>/dev/null; then
-        printf '%s - Snapshot : snapshot_%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ts" >> /var/log/fire-ux.log
+    local dir="/etc/fire-ux/profiles" ts name pf; mkdir -p "$dir"; ts="$(date +%Y%m%d%H%M%S)"
+    name="$(printf '%s' "$(_param "$_post_body" "name")" | tr -cd '[:alnum:]._-' | head -c 48)"
+    [ -n "$name" ] && pf="${dir}/${name}" || pf="${dir}/snapshot_${ts}"
+    if iptables-save > "${pf}" 2>/dev/null; then
+        printf '%s - Snapshot : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(basename "${pf}")" >> /var/log/fire-ux.log
         _send_redirect "/profiles?msg=snapshot_saved"
     else _send_redirect "/profiles?msg=error_snapshot_failed"; fi
 }
@@ -228,10 +244,51 @@ _handle_quick_ban() {
     else _send_redirect "/?msg=error_add_failed"; fi
 }
 
+_handle_clear_logs() {
+    if > /var/log/fire-ux.log 2>/dev/null; then
+        printf '%s - Journaux vidés\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/fire-ux.log
+        _send_redirect "/logs?msg=logs_cleared"
+    else _send_redirect "/logs?msg=error_clear_failed"; fi
+}
+
+_handle_add_chain() {
+    local name ipt
+    name="$(printf '%s' "$(_param "$_post_body" "name")" | tr -cd '[:alnum:]_-' | head -c 28)"
+    ipt="$(_param "$_post_body" "ipt")"; [[ "$ipt" == "6" ]] && ipt="ip6tables" || ipt="iptables"
+    [[ -z "$name" ]] && { _send_redirect "/rules?msg=error_invalid_chain_name"; return; }
+    case "$name" in INPUT|OUTPUT|FORWARD) _send_redirect "/rules?msg=error_builtin_chain"; return ;; esac
+    if "$ipt" -N "$name" 2>/dev/null; then
+        printf '%s - Chaîne créée : %s (%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$ipt" >> /var/log/fire-ux.log
+        _send_redirect "/rules?msg=chain_created"
+    else _send_redirect "/rules?msg=error_chain_exists"; fi
+}
+
+_handle_delete_chain() {
+    local name ipt
+    name="$(printf '%s' "$(_param "$_post_body" "name")" | tr -cd '[:alnum:]_-' | head -c 28)"
+    ipt="$(_param "$_post_body" "ipt")"; [[ "$ipt" == "6" ]] && ipt="ip6tables" || ipt="iptables"
+    [[ -z "$name" ]] && { _send_redirect "/rules?msg=error_invalid_chain_name"; return; }
+    case "$name" in INPUT|OUTPUT|FORWARD) _send_redirect "/rules?msg=error_builtin_chain"; return ;; esac
+    "$ipt" -F "$name" 2>/dev/null || true
+    if "$ipt" -X "$name" 2>/dev/null; then
+        printf '%s - Chaîne supprimée : %s (%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$ipt" >> /var/log/fire-ux.log
+        _send_redirect "/rules?msg=chain_deleted"
+    else _send_redirect "/rules?msg=error_chain_in_use"; fi
+}
+
+_handle_save_settings() {
+    local conf="/etc/fire-ux/web.conf"
+    local port; port="$(_param "$_post_body" "port")"
+    [[ "$port" =~ ^[0-9]{2,5}$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || port="8080"
+    printf 'WEB_PORT=%s\n' "$port" > "$conf" 2>/dev/null || true
+    _send_redirect "/settings?msg=settings_saved"
+}
+
 # ── API : /api/stats ──────────────────────────────────────────────────────────
 _api_stats() {
     local ci co cf pi po pf upv hn ip mem_t mem_f mem_used mem_pct
     local cpu_pct ncpu load conns ts
+    local ci6=0 co6=0 cf6=0
 
     ci=$(iptables -L INPUT   --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l)
     co=$(iptables -L OUTPUT  --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l)
@@ -239,6 +296,13 @@ _api_stats() {
     pi=$(iptables -L INPUT   2>/dev/null|head -1|awk '{print $4}'|tr -d ')')
     po=$(iptables -L OUTPUT  2>/dev/null|head -1|awk '{print $4}'|tr -d ')')
     pf=$(iptables -L FORWARD 2>/dev/null|head -1|awk '{print $4}'|tr -d ')')
+
+    if command -v ip6tables &>/dev/null; then
+        ci6=$(ip6tables -L INPUT   --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l||echo 0)
+        co6=$(ip6tables -L OUTPUT  --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l||echo 0)
+        cf6=$(ip6tables -L FORWARD --line-numbers -n 2>/dev/null|tail -n+3|grep -v '^$'|wc -l||echo 0)
+    fi
+
     upv=$(uptime -p 2>/dev/null|sed 's/up //'||uptime|sed 's/.*up //;s/,.*//')
     hn=$(hostname 2>/dev/null||echo "host")
     ip=$(hostname -I 2>/dev/null|awk '{print $1}'||echo "")
@@ -252,8 +316,8 @@ _api_stats() {
     conns=$(ss -tn state established 2>/dev/null|tail -n+2|wc -l||echo 0)
     ts=$(date '+%Y-%m-%d %H:%M:%S')
 
-    _send_json "$(printf '{"rules_input":%d,"rules_output":%d,"rules_forward":%d,"policy_input":"%s","policy_output":"%s","policy_forward":"%s","server_pid":"%s","uptime":"%s","hostname":"%s","ip":"%s","mem_pct":%d,"cpu_pct":%d,"connections":%d,"load":"%s","timestamp":"%s"}' \
-        "$ci" "$co" "$cf" "$pi" "$po" "$pf" "${SERVER_PID:-}" "$upv" "$hn" "$ip" "$mem_pct" "$cpu_pct" "$conns" "$load" "$ts")"
+    _send_json "$(printf '{"rules_input":%d,"rules_output":%d,"rules_forward":%d,"policy_input":"%s","policy_output":"%s","policy_forward":"%s","rules_input6":%d,"rules_output6":%d,"rules_forward6":%d,"server_pid":"%s","uptime":"%s","hostname":"%s","ip":"%s","mem_pct":%d,"cpu_pct":%d,"connections":%d,"load":"%s","timestamp":"%s"}' \
+        "$ci" "$co" "$cf" "$pi" "$po" "$pf" "$ci6" "$co6" "$cf6" "${SERVER_PID:-}" "$upv" "$hn" "$ip" "$mem_pct" "$cpu_pct" "$conns" "$load" "$ts")"
 }
 
 # ── API : /api/logs ───────────────────────────────────────────────────────────
@@ -282,7 +346,7 @@ _api_health() {
     has_est=$(iptables -L INPUT -n 2>/dev/null|grep -c "ESTABLISHED"||echo 0)
     has_ssh=$(iptables -L INPUT -n 2>/dev/null|grep -c "dpt:22"||echo 0)
 
-    local w=() a=()
+    local w=()
     [ "$pi" = "ACCEPT" ] && [ "$ri" -eq 0 ] && \
         w+=('{"level":"info","msg":"Aucun filtrage INPUT actif"}')
     { [ "$pi" = "DROP" ] || [ "$pi" = "REJECT" ]; } && [ "${has_est:-0}" -eq 0 ] && \
@@ -296,6 +360,32 @@ _api_health() {
     for ww in "${w[@]}"; do $first||json+=","; json+="$ww"; first=false; done
     json+=']'
     _send_json "{\"warnings\":${json},\"count\":${#w[@]}}"
+}
+
+# ── API : /api/rules ──────────────────────────────────────────────────────────
+_api_rules() {
+    local chain; chain="$(_qparam "chain")"
+    case "$chain" in INPUT|OUTPUT|FORWARD) ;; *) chain="INPUT" ;; esac
+    local ver; ver="$(_qparam "v")"
+    local ipt="iptables"; [ "$ver" = "6" ] && ipt="ip6tables"
+
+    local rules_json="[" first=true
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local num tgt prot src dst opts
+        num=$(printf '%s' "$line" | awk '{print $1}')
+        tgt=$(printf '%s' "$line" | awk '{print $2}')
+        prot=$(printf '%s' "$line" | awk '{print $3}')
+        src=$(printf '%s' "$line" | awk '{print $4}')
+        dst=$(printf '%s' "$line" | awk '{print $5}')
+        opts=$(printf '%s' "$line" | awk '{$1=$2=$3=$4=$5="";print $0}' | sed 's/^ *//' | sed 's/\\/\\\\/g;s/"/\\"/g')
+        $first || rules_json+=","
+        rules_json+="{\"num\":\"$num\",\"target\":\"$tgt\",\"proto\":\"$prot\",\"src\":\"$src\",\"dst\":\"$dst\",\"opts\":\"$opts\"}"
+        first=false
+    done < <("$ipt" -L "$chain" --line-numbers -n 2>/dev/null | tail -n+3 | grep -v '^$')
+    rules_json+="]"
+    local policy; policy=$("$ipt" -L "$chain" 2>/dev/null | head -1 | awk '{print $4}' | tr -d ')')
+    _send_json "{\"chain\":\"$chain\",\"version\":\"$ver\",\"policy\":\"$policy\",\"rules\":$rules_json}"
 }
 
 # ── Export iptables-save ──────────────────────────────────────────────────────
@@ -326,6 +416,7 @@ case "${_method}|${_clean_path}" in
     "GET|/api/stats")     _api_stats   ;;
     "GET|/api/logs")      _api_logs    ;;
     "GET|/api/health")    _api_health  ;;
+    "GET|/api/rules")     _api_rules   ;;
     "GET|/export")        _handle_export ;;
     "GET|/favicon.ico")   printf "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n" ;;
     "POST|/apply-preset")   _handle_apply_preset   ;;
@@ -337,5 +428,9 @@ case "${_method}|${_clean_path}" in
     "POST|/apply-profile")  _handle_apply_profile   ;;
     "POST|/delete-profile") _handle_delete_profile  ;;
     "POST|/quick-ban")      _handle_quick_ban       ;;
+    "POST|/clear-logs")     _handle_clear_logs      ;;
+    "POST|/add-chain")      _handle_add_chain       ;;
+    "POST|/delete-chain")   _handle_delete_chain    ;;
+    "POST|/save-settings")  _handle_save_settings   ;;
     *)                      _send_404 ;;
 esac
